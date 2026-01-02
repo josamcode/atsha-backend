@@ -272,8 +272,8 @@ const sendEmail = async ({ to, subject, html, text }) => {
 
 // Helper function to format dates for emails using Saudi timezone
 const formatEmailDate = (date, language = 'en') => {
-  const locale = language === 'ar' ? 'ar-US' : 'en-US';
-  return dateUtils.formatDate(date, {}, locale);
+  const locale = language === 'ar' ? 'ar-SA' : 'en-US';
+  return dateUtils.formatDate(date, { calendar: 'gregory' }, locale);
 };
 
 // Form submitted email
