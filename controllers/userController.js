@@ -4,6 +4,7 @@ const { createNotification } = require('../utils/notifications');
 const { sendEmailToUser, getEmployeeReportEmail } = require('../utils/emailService');
 const { getUsers, getUserById, getUserCount, searchUsers, PROJECTIONS } = require('../utils/userQueries');
 const logger = require('../utils/logger');
+const { deleteStoredAsset, uploadUserImage } = require('../utils/mediaStorage');
 
 // @desc    Get all users
 // @route   GET /api/users
@@ -146,6 +147,9 @@ exports.getUser = async (req, res) => {
 // @route   POST /api/users
 // @access  Private (Admin only)
 exports.createUser = async (req, res) => {
+  let uploadedImageUrl = null;
+  let createdUser = null;
+
   try {
     const { name, email, password, phone, role, department, departments, languagePreference, leaveBalance, workDays, workSchedule, nationality, idNumber, jobTitle } = req.body;
 
@@ -158,8 +162,10 @@ exports.createUser = async (req, res) => {
       });
     }
 
-    // Handle image upload
-    const imagePath = req.file ? `/uploads/${req.file.filename}` : undefined;
+    if (req.file) {
+      const uploadedImage = await uploadUserImage(req.file);
+      uploadedImageUrl = uploadedImage.secure_url;
+    }
 
     // Normalize workSchedule to ensure it's always a proper object
     // Prevent storing as array, string, or other invalid types
@@ -211,8 +217,9 @@ exports.createUser = async (req, res) => {
       nationality: nationality || undefined,
       idNumber: idNumber || undefined,
       jobTitle: jobTitle || undefined,
-      image: imagePath
+      image: uploadedImageUrl || undefined
     });
+    createdUser = user;
 
     // Create notification for admins when new user is created
     const roleMap = {
@@ -247,6 +254,14 @@ exports.createUser = async (req, res) => {
       data: user
     });
   } catch (error) {
+    if (!createdUser && uploadedImageUrl) {
+      try {
+        await deleteStoredAsset(uploadedImageUrl);
+      } catch (cleanupError) {
+        console.error('Error deleting uploaded user image after failure:', cleanupError);
+      }
+    }
+
     res.status(500).json({
       success: false,
       message: error.message
@@ -258,6 +273,9 @@ exports.createUser = async (req, res) => {
 // @route   PUT /api/users/:id
 // @access  Private (Admin only)
 exports.updateUser = async (req, res) => {
+  let newImageUrl = null;
+  let updateCompleted = false;
+
   try {
     const { name, email, phone, role, department, departments, languagePreference, isActive, leaveBalance, workDays, workSchedule, nationality, idNumber, jobTitle } = req.body;
 
@@ -328,22 +346,9 @@ exports.updateUser = async (req, res) => {
 
     // Handle image upload
     if (req.file) {
-      // Store old image path for deletion (async, non-blocking)
-      const oldImagePath = user.image;
-      updateFields.image = `/uploads/${req.file.filename}`;
-
-      // Delete old image asynchronously (non-blocking)
-      if (oldImagePath) {
-        const fs = require('fs');
-        const path = require('path');
-        const fullOldImagePath = path.join(process.env.UPLOAD_DIR || './uploads', path.basename(oldImagePath));
-        // Delete in background, don't wait for it
-        fs.unlink(fullOldImagePath, (err) => {
-          if (err && err.code !== 'ENOENT') {
-            console.error('Error deleting old user image:', err);
-          }
-        });
-      }
+      const uploadedImage = await uploadUserImage(req.file);
+      newImageUrl = uploadedImage.secure_url;
+      updateFields.image = newImageUrl;
     }
 
     // Use findByIdAndUpdate for better performance
@@ -352,12 +357,29 @@ exports.updateUser = async (req, res) => {
       { $set: updateFields },
       { new: true, runValidators: true }
     ).select('-password -refreshToken');
+    updateCompleted = true;
+
+    if (newImageUrl && user.image && user.image !== newImageUrl) {
+      try {
+        await deleteStoredAsset(user.image);
+      } catch (cleanupError) {
+        console.error('Error deleting old user image:', cleanupError);
+      }
+    }
 
     res.json({
       success: true,
       data: updatedUser
     });
   } catch (error) {
+    if (!updateCompleted && newImageUrl) {
+      try {
+        await deleteStoredAsset(newImageUrl);
+      } catch (cleanupError) {
+        console.error('Error deleting newly uploaded user image after failure:', cleanupError);
+      }
+    }
+
     res.status(500).json({
       success: false,
       message: error.message

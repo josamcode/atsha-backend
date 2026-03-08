@@ -4,8 +4,7 @@ const { createNotification } = require('../utils/notifications');
 const User = require('../models/User');
 const pdfGenerator = require('../utils/pdfGenerator');
 const { sendEmailToAdmins, sendEmailToUser, getFormSubmittedEmail, getFormApprovedEmail, getFormRejectedEmail } = require('../utils/emailService');
-const path = require('path');
-const fs = require('fs');
+const { deleteStoredAsset, uploadFormImage } = require('../utils/mediaStorage');
 
 // @desc    Get all form instances
 // @route   GET /api/form-instances
@@ -547,18 +546,13 @@ exports.getFormStats = async (req, res) => {
 // @route   POST /api/form-instances/:id/images
 // @access  Private (Admin, Supervisor)
 exports.uploadFormImages = async (req, res) => {
+  const uploadedImages = [];
+  let imagesSaved = false;
+
   try {
     const formInstance = await FormInstance.findById(req.params.id);
 
     if (!formInstance) {
-      // Delete uploaded files if form instance not found
-      if (req.files && req.files.length > 0) {
-        req.files.forEach(file => {
-          fs.unlink(file.path, (err) => {
-            if (err) console.error('Error deleting file:', err);
-          });
-        });
-      }
       return res.status(404).json({
         success: false,
         message: 'Form instance not found'
@@ -567,14 +561,6 @@ exports.uploadFormImages = async (req, res) => {
 
     // Check access rights
     if (req.user.role === 'admin' && req.user.department !== 'management' && formInstance.department !== req.user.department) {
-      // Delete uploaded files if access denied
-      if (req.files && req.files.length > 0) {
-        req.files.forEach(file => {
-          fs.unlink(file.path, (err) => {
-            if (err) console.error('Error deleting file:', err);
-          });
-        });
-      }
       return res.status(403).json({
         success: false,
         message: 'You do not have access to this form'
@@ -584,14 +570,6 @@ exports.uploadFormImages = async (req, res) => {
     if (req.user.role === 'supervisor') {
       const user = await User.findById(formInstance.filledBy);
       if (!req.user.departments.includes(user.department)) {
-        // Delete uploaded files if access denied
-        if (req.files && req.files.length > 0) {
-          req.files.forEach(file => {
-            fs.unlink(file.path, (err) => {
-              if (err) console.error('Error deleting file:', err);
-            });
-          });
-        }
         return res.status(403).json({
           success: false,
           message: 'You do not have access to this form'
@@ -606,14 +584,17 @@ exports.uploadFormImages = async (req, res) => {
       });
     }
 
-    // Process uploaded files
-    const uploadedImages = req.files.map(file => ({
-      filename: file.originalname,
-      path: `/uploads/${file.filename}`,
-      mimetype: file.mimetype,
-      size: file.size,
-      uploadedAt: new Date()
-    }));
+    // Upload files to Cloudinary and store the returned URLs.
+    for (const file of req.files) {
+      const uploadedImage = await uploadFormImage(file, formInstance._id.toString());
+      uploadedImages.push({
+        filename: file.originalname,
+        path: uploadedImage.secure_url,
+        mimetype: file.mimetype,
+        size: file.size,
+        uploadedAt: new Date()
+      });
+    }
 
     // Add images to form instance
     if (!formInstance.images) {
@@ -622,6 +603,7 @@ exports.uploadFormImages = async (req, res) => {
     formInstance.images.push(...uploadedImages);
 
     await formInstance.save();
+    imagesSaved = true;
 
     res.json({
       success: true,
@@ -629,14 +611,16 @@ exports.uploadFormImages = async (req, res) => {
       data: uploadedImages
     });
   } catch (error) {
-    // Delete uploaded files on error
-    if (req.files && req.files.length > 0) {
-      req.files.forEach(file => {
-        fs.unlink(file.path, (err) => {
-          if (err) console.error('Error deleting file:', err);
-        });
-      });
+    if (!imagesSaved && uploadedImages.length > 0) {
+      await Promise.all(uploadedImages.map(async (image) => {
+        try {
+          await deleteStoredAsset(image.path);
+        } catch (cleanupError) {
+          console.error('Error deleting uploaded form image after failure:', cleanupError);
+        }
+      }));
     }
+
     res.status(500).json({
       success: false,
       message: error.message
@@ -686,12 +670,12 @@ exports.deleteFormImage = async (req, res) => {
       });
     }
 
-    // Delete file from filesystem
-    const filePath = path.join(process.env.UPLOAD_DIR || './uploads', path.basename(image.path));
-    if (fs.existsSync(filePath)) {
-      fs.unlink(filePath, (err) => {
-        if (err) console.error('Error deleting file:', err);
-      });
+    if (image.path) {
+      try {
+        await deleteStoredAsset(image.path);
+      } catch (cleanupError) {
+        console.error('Error deleting form image asset:', cleanupError);
+      }
     }
 
     // Remove image from form instance
@@ -709,4 +693,3 @@ exports.deleteFormImage = async (req, res) => {
     });
   }
 };
-
