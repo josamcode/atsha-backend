@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const attendanceLogSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -42,9 +47,9 @@ const attendanceLogSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-attendanceLogSchema.index({ userId: 1, timestamp: -1 });
-attendanceLogSchema.index({ timestamp: -1 });
-attendanceLogSchema.index({ type: 1, timestamp: -1 });
+attendanceLogSchema.index({ organizationId: 1, userId: 1, timestamp: -1 });
+attendanceLogSchema.index({ organizationId: 1, timestamp: -1 });
+attendanceLogSchema.index({ organizationId: 1, type: 1, timestamp: -1 });
 
 module.exports = mongoose.model('AttendanceLog', attendanceLogSchema);
 

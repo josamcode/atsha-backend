@@ -1,6 +1,12 @@
 const mongoose = require('mongoose');
+const { isValidDepartmentCode, normalizeDepartmentCode } = require('../utils/tenantConstants');
 
 const formInstanceSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   templateId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'FormTemplate',
@@ -13,8 +19,14 @@ const formInstanceSchema = new mongoose.Schema({
   },
   department: {
     type: String,
-    enum: ['kitchen', 'counter', 'cleaning', 'management', 'delivery', 'other'],
-    required: true
+    required: true,
+    trim: true,
+    lowercase: true,
+    set: normalizeDepartmentCode,
+    validate: {
+      validator: (value) => isValidDepartmentCode(value),
+      message: 'Department code must use lowercase letters, numbers, hyphens, or underscores'
+    }
   },
   date: {
     type: Date,
@@ -68,10 +80,10 @@ const formInstanceSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-formInstanceSchema.index({ templateId: 1, date: -1 });
-formInstanceSchema.index({ filledBy: 1, date: -1 });
-formInstanceSchema.index({ department: 1, date: -1 });
-formInstanceSchema.index({ status: 1, date: -1 });
+formInstanceSchema.index({ organizationId: 1, templateId: 1, date: -1 });
+formInstanceSchema.index({ organizationId: 1, filledBy: 1, date: -1 });
+formInstanceSchema.index({ organizationId: 1, department: 1, date: -1 });
+formInstanceSchema.index({ organizationId: 1, status: 1, date: -1 });
 
 module.exports = mongoose.model('FormInstance', formInstanceSchema);
 

@@ -1,26 +1,204 @@
-const User = require('../models/User');
-const { generateAccessToken, generateRefreshToken, verifyRefreshToken, generateResetToken } = require('../utils/tokenUtils');
-const { sendEmailToUser, getPasswordResetEmail, getPasswordResetRequestEmail, getPasswordResetByAdminEmail, sendEmailToAdmins } = require('../utils/emailService');
 const crypto = require('crypto');
+const User = require('../models/User');
+const Organization = require('../models/Organization');
+const {
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken,
+  generateResetToken
+} = require('../utils/tokenUtils');
+const {
+  sendEmailToUser,
+  getPasswordResetEmail,
+  getPasswordResetRequestEmail,
+  sendEmailToAdmins
+} = require('../utils/emailService');
+const { normalizeRole, toLegacyRole } = require('../utils/tenantConstants');
+
+const buildOrganizationScopedEmailQuery = (email, organizationId) => {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const query = { email: normalizedEmail };
+
+  if (!organizationId) {
+    return query;
+  }
+
+  return {
+    ...query,
+    $or: [
+      { organizationId },
+      { organizationId: { $exists: false } },
+      { organizationId: null }
+    ]
+  };
+};
+
+const buildScopedUserQuery = (userId, organizationId) => {
+  const query = { _id: userId };
+
+  if (!organizationId) {
+    return query;
+  }
+
+  return {
+    ...query,
+    $or: [
+      { organizationId },
+      { organizationId: { $exists: false } },
+      { organizationId: null }
+    ]
+  };
+};
+
+const formatOrganization = (organization) => {
+  if (!organization) {
+    return null;
+  }
+
+  return {
+    id: organization._id,
+    name: organization.name,
+    slug: organization.slug,
+    status: organization.status,
+    locale: organization.locale,
+    timezone: organization.timezone,
+    branding: organization.branding || {},
+    featureFlags: organization.featureFlags || {}
+  };
+};
+
+const formatUser = (user) => ({
+  id: user._id,
+  organizationId: user.organizationId || null,
+  name: user.name,
+  email: user.email,
+  phone: user.phone,
+  role: toLegacyRole(user.role),
+  organizationRole: normalizeRole(user.role),
+  department: user.department,
+  departments: user.departments,
+  languagePreference: user.languagePreference,
+  leaveBalance: user.leaveBalance,
+  isActive: user.isActive,
+  workDays: user.workDays || [],
+  workSchedule: user.workSchedule || {}
+});
+
+const getActiveOrganization = (req, res) => {
+  if (!req.organization) {
+    res.status(400).json({
+      success: false,
+      message: 'Organization context is required'
+    });
+    return null;
+  }
+
+  if (req.organization.status !== 'active') {
+    res.status(403).json({
+      success: false,
+      message: 'Organization is not active'
+    });
+    return null;
+  }
+
+  return req.organization;
+};
+
+const ensureUserBelongsToOrganization = (user, organization, res) => {
+  if (!user?.organizationId) {
+    return true;
+  }
+
+  if (String(user.organizationId) !== String(organization._id)) {
+    res.status(401).json({
+      success: false,
+      message: 'User does not belong to the active organization'
+    });
+    return false;
+  }
+
+  return true;
+};
+
+const buildAuthResponse = (user, organization, tokens = {}) => ({
+  success: true,
+  data: {
+    user: formatUser(user),
+    organization: formatOrganization(organization),
+    ...tokens
+  }
+});
+
+const attachLegacyUserToOrganization = async (user, organization) => {
+  if (!user || user.organizationId || !organization?._id) {
+    return;
+  }
+
+  await User.updateOne(
+    {
+      _id: user._id,
+      $or: [
+        { organizationId: { $exists: false } },
+        { organizationId: null }
+      ]
+    },
+    { $set: { organizationId: organization._id } }
+  );
+
+  user.organizationId = organization._id;
+};
+
+// @desc    Resolve organization bootstrap context
+// @route   GET /api/auth/organization
+// @access  Public
+exports.getOrganizationContext = async (req, res) => {
+  const organization = getActiveOrganization(req, res);
+  if (!organization) {
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      organization: formatOrganization(organization)
+    }
+  });
+};
 
 // @desc    Register user
 // @route   POST /api/auth/register
 // @access  Public (Admin only in production)
 exports.register = async (req, res) => {
   try {
-    const { name, email, password, phone, role, department, departments, languagePreference } = req.body;
+    const organization = getActiveOrganization(req, res);
+    if (!organization) {
+      return;
+    }
 
-    // Check if user exists (optimized - only check email)
-    const existingUser = await User.findOne({ email }).select('_id email').lean();
+    const {
+      name,
+      email,
+      password,
+      phone,
+      role,
+      department,
+      departments,
+      languagePreference
+    } = req.body;
+
+    const existingUser = await User.findOne(
+      buildOrganizationScopedEmailQuery(email, organization._id)
+    ).select('_id email organizationId').lean();
+
     if (existingUser) {
       return res.status(400).json({
         success: false,
-        message: 'User already exists with this email'
+        message: 'User already exists with this email in this organization'
       });
     }
 
-    // Create user
     const user = await User.create({
+      organizationId: organization._id,
       name,
       email,
       password,
@@ -31,30 +209,20 @@ exports.register = async (req, res) => {
       languagePreference: languagePreference || 'en'
     });
 
-    // Generate tokens
-    const accessToken = generateAccessToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
+    const accessToken = generateAccessToken(user, organization);
+    const refreshToken = generateRefreshToken(user, organization);
 
-    // Save refresh token to user
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { refreshToken } }
+    );
+
     user.refreshToken = refreshToken;
-    await user.save();
 
-    res.status(201).json({
-      success: true,
-      data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          department: user.department,
-          departments: user.departments,
-          languagePreference: user.languagePreference
-        },
-        accessToken,
-        refreshToken
-      }
-    });
+    res.status(201).json(buildAuthResponse(user, organization, {
+      accessToken,
+      refreshToken
+    }));
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -68,9 +236,13 @@ exports.register = async (req, res) => {
 // @access  Public
 exports.login = async (req, res) => {
   try {
+    const organization = getActiveOrganization(req, res);
+    if (!organization) {
+      return;
+    }
+
     const { email, password } = req.body;
 
-    // Validate input
     if (!email || !password) {
       return res.status(400).json({
         success: false,
@@ -78,8 +250,10 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Check for user
-    const user = await User.findOne({ email }).select('+password');
+    const user = await User.findOne(
+      buildOrganizationScopedEmailQuery(email, organization._id)
+    ).select('+password');
+
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -87,7 +261,10 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Check if user is active
+    if (!ensureUserBelongsToOrganization(user, organization, res)) {
+      return;
+    }
+
     if (!user.isActive) {
       return res.status(401).json({
         success: false,
@@ -95,7 +272,6 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Check password
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
       return res.status(401).json({
@@ -104,32 +280,22 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Generate tokens
-    const accessToken = generateAccessToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
+    await attachLegacyUserToOrganization(user, organization);
 
-    // Save refresh token (use updateOne to avoid full document validation)
+    const accessToken = generateAccessToken(user, organization);
+    const refreshToken = generateRefreshToken(user, organization);
+
     await User.updateOne(
       { _id: user._id },
-      { refreshToken }
+      { $set: { refreshToken } }
     );
 
-    res.json({
-      success: true,
-      data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          department: user.department,
-          departments: user.departments,
-          languagePreference: user.languagePreference
-        },
-        accessToken,
-        refreshToken
-      }
-    });
+    user.refreshToken = refreshToken;
+
+    res.json(buildAuthResponse(user, organization, {
+      accessToken,
+      refreshToken
+    }));
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -152,7 +318,6 @@ exports.refreshToken = async (req, res) => {
       });
     }
 
-    // Verify refresh token
     const decoded = verifyRefreshToken(refreshToken);
     if (!decoded) {
       return res.status(401).json({
@@ -161,8 +326,45 @@ exports.refreshToken = async (req, res) => {
       });
     }
 
-    // Get user
-    const user = await User.findById(decoded.id).select('+refreshToken');
+    let organization = req.organization;
+    if (decoded.organizationId) {
+      const tokenOrganization = await Organization.findById(decoded.organizationId).lean();
+
+      if (!tokenOrganization) {
+        return res.status(401).json({
+          success: false,
+          message: 'Organization not found for this session'
+        });
+      }
+
+      if (organization && String(organization._id) !== String(tokenOrganization._id)) {
+        return res.status(401).json({
+          success: false,
+          message: 'Refresh token organization does not match the active organization'
+        });
+      }
+
+      organization = tokenOrganization;
+    }
+
+    if (!organization) {
+      return res.status(400).json({
+        success: false,
+        message: 'Organization context is required'
+      });
+    }
+
+    if (organization.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: 'Organization is not active'
+      });
+    }
+
+    const user = await User.findOne(
+      buildScopedUserQuery(decoded.id, organization._id)
+    ).select('+refreshToken');
+
     if (!user || user.refreshToken !== refreshToken) {
       return res.status(401).json({
         success: false,
@@ -170,13 +372,39 @@ exports.refreshToken = async (req, res) => {
       });
     }
 
-    // Generate new access token
-    const accessToken = generateAccessToken(user._id);
+    if (!ensureUserBelongsToOrganization(user, organization, res)) {
+      return;
+    }
+
+    if (!user.isActive) {
+      return res.status(401).json({
+        success: false,
+        message: 'Your account has been deactivated'
+      });
+    }
+
+    if (decoded.role && normalizeRole(decoded.role) !== normalizeRole(user.role)) {
+      return res.status(401).json({
+        success: false,
+        message: 'User role changed. Please sign in again.'
+      });
+    }
+
+    const currentSessionVersion = organization.securitySettings?.sessionVersion || 1;
+    if (decoded.sessionVersion && decoded.sessionVersion !== currentSessionVersion) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session is no longer valid. Please sign in again.'
+      });
+    }
+
+    const accessToken = generateAccessToken(user, organization);
 
     res.json({
       success: true,
       data: {
-        accessToken
+        accessToken,
+        organization: formatOrganization(organization)
       }
     });
   } catch (error) {
@@ -192,9 +420,10 @@ exports.refreshToken = async (req, res) => {
 // @access  Private
 exports.logout = async (req, res) => {
   try {
-    // Clear refresh token
-    req.user.refreshToken = null;
-    await req.user.save();
+    await User.updateOne(
+      buildScopedUserQuery(req.user.id, req.organization?._id),
+      { $set: { refreshToken: null } }
+    );
 
     res.json({
       success: true,
@@ -213,27 +442,11 @@ exports.logout = async (req, res) => {
 // @access  Private
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const user = await User.findOne(
+      buildScopedUserQuery(req.user.id, req.organization?._id)
+    );
 
-    res.json({
-      success: true,
-      data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          phone: user.phone,
-          role: user.role,
-          department: user.department,
-          departments: user.departments,
-          languagePreference: user.languagePreference,
-          leaveBalance: user.leaveBalance,
-          isActive: user.isActive,
-          workDays: user.workDays || [],
-          workSchedule: user.workSchedule || {}
-        }
-      }
-    });
+    res.json(buildAuthResponse(user || req.user, req.organization));
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -249,7 +462,16 @@ exports.updateProfile = async (req, res) => {
   try {
     const { name, phone, languagePreference } = req.body;
 
-    const user = await User.findById(req.user.id);
+    const user = await User.findOne(
+      buildScopedUserQuery(req.user.id, req.organization?._id)
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
 
     if (name) user.name = name;
     if (phone) user.phone = phone;
@@ -257,21 +479,7 @@ exports.updateProfile = async (req, res) => {
 
     await user.save();
 
-    res.json({
-      success: true,
-      data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          phone: user.phone,
-          role: user.role,
-          department: user.department,
-          departments: user.departments,
-          languagePreference: user.languagePreference
-        }
-      }
-    });
+    res.json(buildAuthResponse(user, req.organization));
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -294,9 +502,17 @@ exports.changePassword = async (req, res) => {
       });
     }
 
-    const user = await User.findById(req.user.id).select('+password');
+    const user = await User.findOne(
+      buildScopedUserQuery(req.user.id, req.organization?._id)
+    ).select('+password');
 
-    // Check current password
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
     const isMatch = await user.comparePassword(currentPassword);
     if (!isMatch) {
       return res.status(401).json({
@@ -305,9 +521,7 @@ exports.changePassword = async (req, res) => {
       });
     }
 
-    // Update password
     user.password = newPassword;
-    // Clear reset token if exists
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
     await user.save();
@@ -329,6 +543,11 @@ exports.changePassword = async (req, res) => {
 // @access  Public
 exports.forgotPassword = async (req, res) => {
   try {
+    const organization = getActiveOrganization(req, res);
+    if (!organization) {
+      return;
+    }
+
     const { email } = req.body;
 
     if (!email) {
@@ -338,29 +557,31 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email }).select('+resetPasswordToken +resetPasswordExpire');
+    const user = await User.findOne(
+      buildOrganizationScopedEmailQuery(email, organization._id)
+    ).select('+resetPasswordToken +resetPasswordExpire');
 
     if (!user) {
-      // Don't reveal if user exists or not for security
       return res.json({
         success: true,
         message: 'If an account with that email exists, a password reset link has been sent'
       });
     }
 
-    // Generate reset token
+    if (!ensureUserBelongsToOrganization(user, organization, res)) {
+      return;
+    }
+
     const resetToken = generateResetToken();
     const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
 
-    // Set reset token and expiry (1 hour)
     user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpire = Date.now() + 60 * 60 * 1000; // 1 hour
+    user.resetPasswordExpire = Date.now() + 60 * 60 * 1000;
     await user.save();
 
-    // Create reset URL
-    const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password/${resetToken}`;
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const resetUrl = `${frontendUrl}/reset-password/${resetToken}?organization=${organization.slug}`;
 
-    // Send email
     const userLanguage = user.languagePreference || 'ar';
     await sendEmailToUser(user.email, (language) => getPasswordResetEmail({
       resetLink: resetUrl,
@@ -403,10 +624,8 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
-    // Hash token to compare
     const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
 
-    // Find user with valid token
     const user = await User.findOne({
       resetPasswordToken: hashedToken,
       resetPasswordExpire: { $gt: Date.now() }
@@ -419,7 +638,25 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
-    // Update password
+    let organization = req.organization;
+    if (!organization && user.organizationId) {
+      organization = await Organization.findById(user.organizationId).lean();
+    }
+
+    if (organization && user.organizationId && String(user.organizationId) !== String(organization._id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset token does not belong to the active organization'
+      });
+    }
+
+    if (organization && organization.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: 'Organization is not active'
+      });
+    }
+
     user.password = password;
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
@@ -442,6 +679,11 @@ exports.resetPassword = async (req, res) => {
 // @access  Public
 exports.requestPasswordReset = async (req, res) => {
   try {
+    const organization = getActiveOrganization(req, res);
+    if (!organization) {
+      return;
+    }
+
     const { email } = req.body;
 
     if (!email) {
@@ -451,28 +693,35 @@ exports.requestPasswordReset = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne(
+      buildOrganizationScopedEmailQuery(email, organization._id)
+    );
 
     if (!user) {
-      // Don't reveal if user exists or not for security
       return res.json({
         success: true,
         message: 'If an account with that email exists, a password reset request has been sent to administrators'
       });
     }
 
-    // Mark that user has requested password reset
+    if (!ensureUserBelongsToOrganization(user, organization, res)) {
+      return;
+    }
+
     user.passwordResetRequested = true;
     user.passwordResetRequestDate = Date.now();
     await user.save();
 
-    // Send email to admins
-    await sendEmailToAdmins((language) => getPasswordResetRequestEmail({
-      userName: user.name,
-      userEmail: user.email,
-      department: user.department,
-      requestDate: user.passwordResetRequestDate
-    }, language), user.department);
+    await sendEmailToAdmins(
+      (language) => getPasswordResetRequestEmail({
+        userName: user.name,
+        userEmail: user.email,
+        department: user.department,
+        requestDate: user.passwordResetRequestDate
+      }, language),
+      user.department,
+      organization._id
+    );
 
     res.json({
       success: true,
@@ -486,4 +735,3 @@ exports.requestPasswordReset = async (req, res) => {
     });
   }
 };
-

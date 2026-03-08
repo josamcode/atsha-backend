@@ -474,14 +474,21 @@ const getLeaveRejectedEmail = (leaveData, language = 'en') => {
 };
 
 // Send email to admins
-const sendEmailToAdmins = async (emailData, department = null) => {
+const sendEmailToAdmins = async (emailData, department = null, organizationId = null) => {
   try {
     devLog('👥 Sending email to admins', { department });
 
     const User = require('../models/User');
 
     // Get all admin users
-    let query = { role: 'admin', isActive: true };
+    let query = {
+      role: { $in: ['admin', 'organization_admin'] },
+      isActive: true
+    };
+
+    if (organizationId) {
+      query.organizationId = organizationId;
+    }
 
     // If department is specified, only send to that department's admins
     if (department && department !== 'all') {

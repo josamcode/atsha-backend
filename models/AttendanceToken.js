@@ -2,6 +2,11 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 
 const attendanceTokenSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   token: {
     type: String,
     required: true,
@@ -40,9 +45,19 @@ const attendanceTokenSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-attendanceTokenSchema.index({ status: 1, validTo: -1 });
-attendanceTokenSchema.index({ createdAt: -1 });
-attendanceTokenSchema.index({ sequenceNumber: -1 });
+attendanceTokenSchema.index({ organizationId: 1, status: 1, validTo: -1 });
+attendanceTokenSchema.index({ organizationId: 1, createdAt: -1 });
+attendanceTokenSchema.index({ organizationId: 1, sequenceNumber: -1 });
+attendanceTokenSchema.index(
+  { organizationId: 1, sequenceNumber: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      organizationId: { $exists: true },
+      sequenceNumber: { $exists: true }
+    }
+  }
+);
 
 // Static method to generate unique token
 attendanceTokenSchema.statics.generateToken = function () {
@@ -50,8 +65,14 @@ attendanceTokenSchema.statics.generateToken = function () {
 };
 
 // Static method to get next sequence number
-attendanceTokenSchema.statics.getNextSequence = async function () {
-  const lastToken = await this.findOne({ sequenceNumber: { $exists: true, $type: 'number' } })
+attendanceTokenSchema.statics.getNextSequence = async function (organizationId) {
+  const query = { sequenceNumber: { $exists: true, $type: 'number' } };
+
+  if (organizationId) {
+    query.organizationId = organizationId;
+  }
+
+  const lastToken = await this.findOne(query)
     .sort({ sequenceNumber: -1 })
     .select('sequenceNumber');
 

@@ -5,6 +5,11 @@ const mongoose = require('mongoose');
  * Separated from User collection to keep user documents lightweight
  */
 const userMetadataSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -47,6 +52,7 @@ const userMetadataSchema = new mongoose.Schema({
 
 // Indexes for efficient queries
 // Note: userId already has unique: true which creates an index, so we only add the compound/other indexes
+userMetadataSchema.index({ organizationId: 1, userId: 1 });
 userMetadataSchema.index({ lastActivityAt: -1 });
 
 module.exports = mongoose.model('UserMetadata', userMetadataSchema);

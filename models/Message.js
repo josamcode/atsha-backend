@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const messageSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   sender: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -46,10 +51,10 @@ const messageSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-messageSchema.index({ sender: 1, createdAt: -1 });
-messageSchema.index({ recipient: 1, read: 1, createdAt: -1 });
-messageSchema.index({ recipient: 1, createdAt: -1 });
-messageSchema.index({ sender: 1, recipient: 1, createdAt: -1 });
+messageSchema.index({ organizationId: 1, sender: 1, createdAt: -1 });
+messageSchema.index({ organizationId: 1, recipient: 1, read: 1, createdAt: -1 });
+messageSchema.index({ organizationId: 1, recipient: 1, createdAt: -1 });
+messageSchema.index({ organizationId: 1, sender: 1, recipient: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Message', messageSchema);
 

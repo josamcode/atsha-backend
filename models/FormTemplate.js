@@ -1,4 +1,9 @@
 const mongoose = require('mongoose');
+const {
+  FORM_VISIBILITY_ROLE_VALUES,
+  isValidDepartmentCode,
+  normalizeDepartmentCode
+} = require('../utils/tenantConstants');
 
 const fieldSchema = new mongoose.Schema({
   key: {
@@ -197,6 +202,11 @@ const sectionSchema = new mongoose.Schema({
 });
 
 const formTemplateSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   title: {
     en: { type: String, required: true },
     ar: { type: String, required: true }
@@ -208,15 +218,21 @@ const formTemplateSchema = new mongoose.Schema({
   sections: [sectionSchema],
   visibleToRoles: [{
     type: String,
-    enum: ['admin', 'supervisor', 'employee']
+    enum: FORM_VISIBILITY_ROLE_VALUES
   }],
   editableByRoles: [{
     type: String,
-    enum: ['admin', 'supervisor', 'employee']
+    enum: FORM_VISIBILITY_ROLE_VALUES
   }],
   departments: [{
     type: String,
-    enum: ['kitchen', 'counter', 'cleaning', 'management', 'delivery', 'other', 'all']
+    trim: true,
+    lowercase: true,
+    set: normalizeDepartmentCode,
+    validate: {
+      validator: (value) => !value || isValidDepartmentCode(value, { allowAll: true }),
+      message: 'Department code must use lowercase letters, numbers, hyphens, or underscores'
+    }
   }],
   requiresApproval: {
     type: Boolean,
@@ -362,6 +378,9 @@ const formTemplateSchema = new mongoose.Schema({
 });
 
 // Index for faster queries
+formTemplateSchema.index({ organizationId: 1, createdBy: 1, createdAt: -1 });
+formTemplateSchema.index({ organizationId: 1, departments: 1, isActive: 1 });
+formTemplateSchema.index({ organizationId: 1, isActive: 1, createdAt: -1 });
 formTemplateSchema.index({ 'title.en': 'text', 'title.ar': 'text' });
 
 module.exports = mongoose.model('FormTemplate', formTemplateSchema);

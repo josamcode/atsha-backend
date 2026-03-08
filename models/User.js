@@ -1,5 +1,10 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const {
+  USER_ROLE_VALUES,
+  isValidDepartmentCode,
+  normalizeDepartmentCode
+} = require('../utils/tenantConstants');
 
 const userSchema = new mongoose.Schema({
   name: {
@@ -7,10 +12,14 @@ const userSchema = new mongoose.Schema({
     required: [true, 'Name is required'],
     trim: true
   },
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   email: {
     type: String,
     required: [true, 'Email is required'],
-    unique: true,
     lowercase: true,
     trim: true,
     match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, 'Please provide a valid email']
@@ -44,17 +53,29 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['admin', 'supervisor', 'employee', 'qr-manager'],
+    enum: USER_ROLE_VALUES,
     default: 'employee'
   },
   department: {
     type: String,
-    enum: ['kitchen', 'counter', 'cleaning', 'management', 'delivery', 'other'],
-    default: 'other'
+    trim: true,
+    lowercase: true,
+    set: normalizeDepartmentCode,
+    default: 'other',
+    validate: {
+      validator: (value) => !value || isValidDepartmentCode(value),
+      message: 'Department code must use lowercase letters, numbers, hyphens, or underscores'
+    }
   },
   departments: [{
     type: String,
-    enum: ['kitchen', 'counter', 'cleaning', 'management', 'delivery', 'other']
+    trim: true,
+    lowercase: true,
+    set: normalizeDepartmentCode,
+    validate: {
+      validator: (value) => !value || isValidDepartmentCode(value),
+      message: 'Department code must use lowercase letters, numbers, hyphens, or underscores'
+    }
   }],
   languagePreference: {
     type: String,
@@ -145,17 +166,25 @@ const userSchema = new mongoose.Schema({
 });
 
 // Indexes for frequently queried fields
-// Note: email already has unique: true which creates an index, so we don't duplicate it
-userSchema.index({ role: 1, isActive: 1 });
-userSchema.index({ department: 1, isActive: 1 });
-userSchema.index({ departments: 1, isActive: 1 });
-userSchema.index({ isActive: 1 });
-userSchema.index({ name: 1 }); // For search queries
-userSchema.index({ createdAt: -1 }); // For sorting by creation date
+userSchema.index(
+  { organizationId: 1, email: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      organizationId: { $exists: true }
+    }
+  }
+);
+userSchema.index({ organizationId: 1, role: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, department: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, departments: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, name: 1 });
+userSchema.index({ organizationId: 1, createdAt: -1 });
 
 // Compound indexes for common query patterns
-userSchema.index({ role: 1, department: 1, isActive: 1 });
-userSchema.index({ email: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, role: 1, department: 1, isActive: 1 });
+userSchema.index({ organizationId: 1, email: 1, isActive: 1 });
 
 // Hash password before saving
 userSchema.pre('save', async function (next) {

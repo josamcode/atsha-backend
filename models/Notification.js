@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const notificationSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   recipient: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -52,8 +57,8 @@ const notificationSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-notificationSchema.index({ recipient: 1, read: 1, createdAt: -1 });
-notificationSchema.index({ recipient: 1, createdAt: -1 });
+notificationSchema.index({ organizationId: 1, recipient: 1, read: 1, createdAt: -1 });
+notificationSchema.index({ organizationId: 1, recipient: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Notification', notificationSchema);
 

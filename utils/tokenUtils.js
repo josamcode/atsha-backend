@@ -1,17 +1,34 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const CryptoJS = require('crypto-js');
+const { normalizeRole } = require('./tenantConstants');
+
+const buildAuthTokenPayload = (user, organization) => {
+  const userId = user?._id || user?.id || user;
+  const organizationId = organization?._id || organization?.id || user?.organizationId;
+
+  if (!userId || !organizationId) {
+    throw new Error('Auth tokens require both userId and organizationId');
+  }
+
+  return {
+    id: userId,
+    organizationId,
+    role: normalizeRole(user?.role),
+    sessionVersion: organization?.securitySettings?.sessionVersion || 1
+  };
+};
 
 // Generate JWT access token
-exports.generateAccessToken = (userId) => {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+exports.generateAccessToken = (user, organization) => {
+  return jwt.sign(buildAuthTokenPayload(user, organization), process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRE || '24h'
   });
 };
 
 // Generate JWT refresh token
-exports.generateRefreshToken = (userId) => {
-  return jwt.sign({ id: userId }, process.env.JWT_REFRESH_SECRET, {
+exports.generateRefreshToken = (user, organization) => {
+  return jwt.sign(buildAuthTokenPayload(user, organization), process.env.JWT_REFRESH_SECRET, {
     expiresIn: process.env.JWT_REFRESH_EXPIRE || '7d'
   });
 };
@@ -69,4 +86,6 @@ exports.verifyQRToken = (token) => {
 exports.generateResetToken = () => {
   return crypto.randomBytes(32).toString('hex');
 };
+
+exports.buildAuthTokenPayload = buildAuthTokenPayload;
 

@@ -6,7 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "migrate:default-org": "node scripts/backfillDefaultOrganization.js",
+    "migrate:default-org:dry": "node scripts/backfillDefaultOrganization.js --dry-run"
   },
   "keywords": [
     "restaurant",

@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const leaveRequestSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -70,8 +75,8 @@ leaveRequestSchema.pre('save', function (next) {
 });
 
 // Indexes
-leaveRequestSchema.index({ userId: 1, startDate: -1 });
-leaveRequestSchema.index({ status: 1, startDate: -1 });
+leaveRequestSchema.index({ organizationId: 1, userId: 1, startDate: -1 });
+leaveRequestSchema.index({ organizationId: 1, status: 1, startDate: -1 });
 
 module.exports = mongoose.model('LeaveRequest', leaveRequestSchema);
 

@@ -5,6 +5,11 @@ const mongoose = require('mongoose');
  * Prevents user documents from growing unbounded
  */
 const userActivityLogSchema = new mongoose.Schema({
+  organizationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
+  },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -52,12 +57,12 @@ const userActivityLogSchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-userActivityLogSchema.index({ userId: 1, createdAt: -1 });
-userActivityLogSchema.index({ action: 1, createdAt: -1 });
-userActivityLogSchema.index({ createdAt: -1 });
+userActivityLogSchema.index({ organizationId: 1, userId: 1, createdAt: -1 });
+userActivityLogSchema.index({ organizationId: 1, action: 1, createdAt: -1 });
+userActivityLogSchema.index({ organizationId: 1, createdAt: -1 });
 
 // Compound index for user activity queries
-userActivityLogSchema.index({ userId: 1, action: 1, createdAt: -1 });
+userActivityLogSchema.index({ organizationId: 1, userId: 1, action: 1, createdAt: -1 });
 
 // TTL index - automatically delete logs older than 1 year (optional)
 // userActivityLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 31536000 });
