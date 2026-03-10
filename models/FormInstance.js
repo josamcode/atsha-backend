@@ -67,6 +67,7 @@ const formInstanceSchema = new mongoose.Schema({
   // Form images (uploaded by admin when viewing/filling the form)
   images: [{
     filename: String,
+    url: String,
     path: String,
     mimetype: String,
     size: Number,

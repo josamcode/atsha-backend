@@ -19,13 +19,13 @@ router.use(protect);
 
 router.route('/')
   .get(authorize('platform_admin', 'admin', 'supervisor', 'employee'), getFormInstances)
-  .post(authorize('platform_admin', 'admin', 'supervisor', 'employee'), createFormInstance);
+  .post(authorize('platform_admin', 'admin', 'supervisor', 'employee'), upload.any(), createFormInstance);
 
 router.get('/stats/summary', authorize('platform_admin', 'admin', 'supervisor'), getFormStats);
 
 router.route('/:id')
   .get(authorize('platform_admin', 'admin', 'supervisor', 'employee'), getFormInstance)
-  .put(authorize('platform_admin', 'admin', 'supervisor', 'employee'), updateFormInstance)
+  .put(authorize('platform_admin', 'admin', 'supervisor', 'employee'), upload.any(), updateFormInstance)
   .delete(authorize('platform_admin', 'admin', 'supervisor', 'employee'), deleteFormInstance);
 
 router.put('/:id/approve', authorize('platform_admin', 'admin', 'supervisor'), approveFormInstance);

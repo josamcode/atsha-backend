@@ -16,7 +16,7 @@ const fieldSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['text', 'textarea', 'static_text', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
+    enum: ['text', 'textarea', 'static_text', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'image', 'file'],
     required: true
   },
   defaultValue: {
@@ -75,7 +75,19 @@ const fieldSchema = new mongoose.Schema({
     },
     alignment: { type: String, enum: ['left', 'center', 'right', 'justify'], default: 'left' },
     lineSpacing: { type: Number, default: 1.2 },
-    fontSize: { type: Number, default: 10 }
+    fontSize: { type: Number, default: 10 },
+    imageWidth: { type: Number, default: 220 },
+    imageHeight: { type: Number, default: 160 },
+    objectFit: {
+      type: String,
+      enum: ['cover', 'contain', 'fill'],
+      default: 'cover'
+    },
+    borderRadius: { type: Number, default: 16 },
+    borderWidth: { type: Number, default: 0 },
+    borderColor: { type: String, default: '#d1d5db' },
+    backgroundColor: { type: String, default: '#f8fafc' },
+    shadow: { type: Boolean, default: false }
   }
 });
 

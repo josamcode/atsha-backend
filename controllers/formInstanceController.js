@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const FormInstance = require('../models/FormInstance');
 const FormTemplate = require('../models/FormTemplate');
 const { createNotification } = require('../utils/notifications');
@@ -93,6 +94,140 @@ const sendControllerError = (res, error) => {
     success: false,
     message: error.message
   });
+};
+
+const parseInstanceValues = (rawValues) => {
+  if (rawValues === undefined) {
+    return undefined;
+  }
+
+  if (typeof rawValues === 'string') {
+    try {
+      return JSON.parse(rawValues);
+    } catch (error) {
+      throw createHttpError(400, 'Invalid form values payload');
+    }
+  }
+
+  return rawValues;
+};
+
+const normalizeInstancePayload = (body = {}) => ({
+  ...body,
+  values: parseInstanceValues(body.values)
+});
+
+const ensureValuesObject = (values) => {
+  if (values === undefined) {
+    return undefined;
+  }
+
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    throw createHttpError(400, 'Form values must be an object');
+  }
+
+  return values;
+};
+
+const getImageFieldKeys = (sections = []) => {
+  const imageFieldKeys = new Set();
+
+  sections.forEach((section) => {
+    (section.fields || []).forEach((field) => {
+      if (field?.type === 'image' && section?.id && field?.key) {
+        imageFieldKeys.add(`${section.id}.${field.key}`);
+      }
+    });
+  });
+
+  return imageFieldKeys;
+};
+
+const getStoredFieldAssetPath = (value) => {
+  if (!value) {
+    return '';
+  }
+
+  if (typeof value === 'object') {
+    return value.url || value.path || '';
+  }
+
+  return '';
+};
+
+const getImageAssetPath = (image) => image?.url || image?.path || '';
+
+const extractStoredAssetPathsFromValues = (values = {}) => (
+  Object.values(values)
+    .map(getStoredFieldAssetPath)
+    .filter(Boolean)
+);
+
+const cleanupStoredAssets = async (assetPaths = []) => {
+  await Promise.all(assetPaths.filter(Boolean).map(async (assetPath) => {
+    try {
+      await deleteStoredAsset(assetPath);
+    } catch (cleanupError) {
+      console.error('Error deleting stored form asset:', cleanupError);
+    }
+  }));
+};
+
+const applyFieldImageUploads = async ({
+  files = [],
+  allowedFieldKeys,
+  organizationId,
+  formInstanceId,
+  uploadedAssets
+}) => {
+  const nextValues = {};
+
+  for (const file of files) {
+    if (!allowedFieldKeys.has(file.fieldname)) {
+      throw createHttpError(400, `Unexpected upload field "${file.fieldname}"`);
+    }
+
+    if (!String(file.mimetype || '').startsWith('image/')) {
+      throw createHttpError(400, 'Only image uploads are allowed for image fields');
+    }
+
+    if (nextValues[file.fieldname]) {
+      throw createHttpError(400, `Only one image is allowed for field "${file.fieldname}"`);
+    }
+
+    const uploadedImage = await uploadFormImage(
+      file,
+      organizationId,
+      formInstanceId
+    );
+
+    const imageValue = {
+      url: uploadedImage.secure_url,
+      filename: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size
+    };
+
+    uploadedAssets.push(imageValue);
+    nextValues[file.fieldname] = imageValue;
+  }
+
+  return nextValues;
+};
+
+const collectRemovedImageAssets = (previousValues = {}, nextValues = {}, imageFieldKeys = new Set()) => {
+  const removedAssets = [];
+
+  imageFieldKeys.forEach((fieldKey) => {
+    const previousPath = getStoredFieldAssetPath(previousValues[fieldKey]);
+    const nextPath = getStoredFieldAssetPath(nextValues[fieldKey]);
+
+    if (previousPath && previousPath !== nextPath) {
+      removedAssets.push(previousPath);
+    }
+  });
+
+  return removedAssets;
 };
 
 const getFormInstanceById = (instanceId) => (
@@ -216,16 +351,11 @@ const ensureInstanceApprovalAccess = (req, instance) => {
 const deleteInstanceAssets = async (instance) => {
   const assets = [
     ...(instance.attachments || []).map((entry) => entry.path).filter(Boolean),
-    ...(instance.images || []).map((entry) => entry.path).filter(Boolean)
+    ...(instance.images || []).map((entry) => getImageAssetPath(entry)).filter(Boolean),
+    ...extractStoredAssetPathsFromValues(instance.values || {})
   ];
 
-  for (const assetPath of assets) {
-    try {
-      await deleteStoredAsset(assetPath);
-    } catch (cleanupError) {
-      console.error('Error deleting stored form asset:', cleanupError);
-    }
-  }
+  await cleanupStoredAssets(assets);
 };
 
 const sendSubmittedNotifications = async (instance, organization) => {
@@ -414,9 +544,11 @@ exports.getFormInstance = async (req, res) => {
 // @route   POST /api/form-instances
 // @access  Private
 exports.createFormInstance = async (req, res) => {
+  const uploadedFieldAssets = [];
+
   try {
     const organization = await resolveFormsOrganization(req);
-    const { templateId, department, date, shift, values, status } = req.body;
+    const { templateId, department, date, shift, values, status } = normalizeInstancePayload(req.body);
 
     if (!templateId) {
       return res.status(400).json({
@@ -427,6 +559,9 @@ exports.createFormInstance = async (req, res) => {
 
     const template = await getTemplateById(templateId, organization._id);
     ensureTemplateAvailability(req, template);
+    const submittedValues = ensureValuesObject(values) || {};
+    const imageFieldKeys = getImageFieldKeys(template.sections || []);
+    const instanceId = new mongoose.Types.ObjectId();
 
     const requestedStatus = status || 'draft';
     if (!['draft', 'submitted'].includes(requestedStatus)) {
@@ -440,13 +575,25 @@ exports.createFormInstance = async (req, res) => {
       requestedDepartment: department
     });
 
+    const uploadedImageValues = await applyFieldImageUploads({
+      files: req.files || [],
+      allowedFieldKeys: imageFieldKeys,
+      organizationId: organization._id.toString(),
+      formInstanceId: instanceId.toString(),
+      uploadedAssets: uploadedFieldAssets
+    });
+
     const instance = await FormInstance.create(attachOrganizationId({
+      _id: instanceId,
       templateId,
       filledBy: req.user.id,
       department: resolvedDepartment,
       date: date || Date.now(),
       shift: shift || 'morning',
-      values: values || {},
+      values: {
+        ...submittedValues,
+        ...uploadedImageValues
+      },
       status: requestedStatus
     }, organization));
 
@@ -488,6 +635,10 @@ exports.createFormInstance = async (req, res) => {
       data: instance
     });
   } catch (error) {
+    if (uploadedFieldAssets.length > 0) {
+      await cleanupStoredAssets(uploadedFieldAssets.map((asset) => asset.url || asset.path));
+    }
+
     sendControllerError(res, error);
   }
 };
@@ -496,6 +647,9 @@ exports.createFormInstance = async (req, res) => {
 // @route   PUT /api/form-instances/:id
 // @access  Private
 exports.updateFormInstance = async (req, res) => {
+  const uploadedFieldAssets = [];
+  let replacedImageAssets = [];
+
   try {
     const instance = await getFormInstanceById(req.params.id);
 
@@ -529,37 +683,57 @@ exports.updateFormInstance = async (req, res) => {
       throw createHttpError(403, 'You do not have permission to edit this form');
     }
 
+    const payload = normalizeInstancePayload(req.body);
     const previousStatus = instance.status;
-    const nextStatus = req.body.status !== undefined ? req.body.status : instance.status;
+    const nextStatus = payload.status !== undefined ? payload.status : instance.status;
     if (!['draft', 'submitted'].includes(nextStatus)) {
       throw createHttpError(400, 'Only draft and submitted statuses are allowed in this endpoint');
     }
 
     if (
-      req.body.status !== undefined &&
+      payload.status !== undefined &&
       nextStatus !== instance.status &&
       !(instance.status === 'draft' && nextStatus === 'submitted')
     ) {
       throw createHttpError(400, 'Invalid form status transition');
     }
 
-    if (req.body.department !== undefined) {
+    if (payload.department !== undefined) {
       instance.department = resolveInstanceDepartment({
         req,
         organization,
         template,
-        requestedDepartment: req.body.department,
+        requestedDepartment: payload.department,
         fallbackDepartment: instance.department
       });
     }
 
-    if (req.body.date !== undefined) instance.date = req.body.date;
-    if (req.body.shift !== undefined) instance.shift = req.body.shift;
-    if (req.body.values !== undefined) instance.values = req.body.values;
-    if (req.body.status !== undefined) instance.status = nextStatus;
+    const imageFieldKeys = getImageFieldKeys(template.sections || []);
+    const nextValues = payload.values !== undefined
+      ? ensureValuesObject(payload.values)
+      : { ...(instance.values || {}) };
+    const uploadedImageValues = await applyFieldImageUploads({
+      files: req.files || [],
+      allowedFieldKeys: imageFieldKeys,
+      organizationId: organization._id.toString(),
+      formInstanceId: instance._id.toString(),
+      uploadedAssets: uploadedFieldAssets
+    });
+    const mergedValues = {
+      ...(nextValues || {}),
+      ...uploadedImageValues
+    };
+
+    replacedImageAssets = collectRemovedImageAssets(instance.values || {}, mergedValues, imageFieldKeys);
+
+    if (payload.date !== undefined) instance.date = payload.date;
+    if (payload.shift !== undefined) instance.shift = payload.shift;
+    if (payload.values !== undefined || uploadedFieldAssets.length > 0) instance.values = mergedValues;
+    if (payload.status !== undefined) instance.status = nextStatus;
 
     await instance.save();
     await populateFormInstance(instance);
+    await cleanupStoredAssets(replacedImageAssets);
 
     await createAuditLog({
       req,
@@ -597,6 +771,10 @@ exports.updateFormInstance = async (req, res) => {
       data: instance
     });
   } catch (error) {
+    if (uploadedFieldAssets.length > 0) {
+      await cleanupStoredAssets(uploadedFieldAssets.map((asset) => asset.url || asset.path));
+    }
+
     sendControllerError(res, error);
   }
 };
@@ -852,6 +1030,7 @@ exports.uploadFormImages = async (req, res) => {
 
       uploadedImages.push({
         filename: file.originalname,
+        url: uploadedImage.secure_url,
         path: uploadedImage.secure_url,
         mimetype: file.mimetype,
         size: file.size,
@@ -876,7 +1055,7 @@ exports.uploadFormImages = async (req, res) => {
     if (!imagesSaved && uploadedImages.length > 0) {
       await Promise.all(uploadedImages.map(async (image) => {
         try {
-          await deleteStoredAsset(image.path);
+          await deleteStoredAsset(getImageAssetPath(image));
         } catch (cleanupError) {
           console.error('Error deleting uploaded form image after failure:', cleanupError);
         }
@@ -913,9 +1092,11 @@ exports.deleteFormImage = async (req, res) => {
       });
     }
 
-    if (image.path) {
+    const imageAssetPath = getImageAssetPath(image);
+
+    if (imageAssetPath) {
       try {
-        await deleteStoredAsset(image.path);
+        await deleteStoredAsset(imageAssetPath);
       } catch (cleanupError) {
         console.error('Error deleting form image asset:', cleanupError);
       }
