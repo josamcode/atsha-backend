@@ -148,8 +148,14 @@ const uploadFormImage = (file, organizationId, formInstanceId) => {
   return uploadBufferToCloudinary(file, folder);
 };
 
+const uploadOrganizationBrandingAsset = (file, organizationId, assetType) => {
+  const folder = `${uploadRootFolder}/organizations/${organizationId}/branding/${assetType}`;
+  return uploadBufferToCloudinary(file, folder);
+};
+
 module.exports = {
   deleteStoredAsset,
   uploadFormImage,
+  uploadOrganizationBrandingAsset,
   uploadUserImage
 };

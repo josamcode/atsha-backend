@@ -108,6 +108,10 @@ const organizationSchema = new mongoose.Schema({
       type: String,
       trim: true
     },
+    watermarkUrl: {
+      type: String,
+      trim: true
+    },
     faviconUrl: {
       type: String,
       trim: true

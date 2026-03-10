@@ -2,11 +2,17 @@ const Organization = require('../models/Organization');
 const User = require('../models/User');
 const Invitation = require('../models/Invitation');
 const { createAuditLog } = require('../utils/auditLogger');
+const { deleteStoredAsset, uploadOrganizationBrandingAsset } = require('../utils/mediaStorage');
 const { resolveManagedOrganization } = require('../utils/organizationAccess');
 const {
   normalizeDepartmentCode,
   normalizeDomain
 } = require('../utils/tenantConstants');
+
+const BRANDING_ASSET_FIELD_MAP = {
+  logo: 'logoUrl',
+  watermark: 'watermarkUrl'
+};
 
 const titleizeDepartment = (value) => value
   .split(/[-_]/)
@@ -271,6 +277,99 @@ exports.updateCurrentOrganizationSettings = async (req, res) => {
       data: formatOrganization(organization)
     });
   } catch (error) {
+    sendControllerError(res, error);
+  }
+};
+
+// @desc    Upload current organization branding asset
+// @route   POST /api/organizations/current/settings/branding-assets/:assetType
+// @access  Private (Organization Admin, Platform Admin)
+exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
+  let uploadedAssetUrl = null;
+
+  try {
+    const organization = await resolveManagedOrganization(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have access to update organization branding'
+      });
+    }
+
+    const assetType = String(req.params.assetType || '').trim().toLowerCase();
+    const brandingField = BRANDING_ASSET_FIELD_MAP[assetType];
+
+    if (!brandingField) {
+      return res.status(400).json({
+        success: false,
+        message: 'Unsupported branding asset type'
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'Image file is required'
+      });
+    }
+
+    if (!String(req.file.mimetype || '').startsWith('image/')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Only image uploads are allowed for branding assets'
+      });
+    }
+
+    const previousAssetUrl = organization.branding?.[brandingField] || null;
+    const uploadedAsset = await uploadOrganizationBrandingAsset(
+      req.file,
+      organization._id.toString(),
+      assetType
+    );
+
+    uploadedAssetUrl = uploadedAsset.secure_url;
+    organization.branding = mergeObject(organization.branding, {
+      [brandingField]: uploadedAssetUrl
+    });
+    await organization.save();
+
+    if (previousAssetUrl && previousAssetUrl !== uploadedAssetUrl) {
+      try {
+        await deleteStoredAsset(previousAssetUrl);
+      } catch (cleanupError) {
+        console.error('Error deleting previous organization branding asset:', cleanupError);
+      }
+    }
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'organization.branding_asset_updated',
+      entityType: 'Organization',
+      entityId: organization._id,
+      metadata: {
+        assetType,
+        brandingField
+      }
+    });
+
+    res.json({
+      success: true,
+      data: formatOrganization(organization),
+      assetType,
+      url: uploadedAssetUrl
+    });
+  } catch (error) {
+    if (uploadedAssetUrl) {
+      try {
+        await deleteStoredAsset(uploadedAssetUrl);
+      } catch (cleanupError) {
+        console.error('Error deleting uploaded branding asset after failure:', cleanupError);
+      }
+    }
+
     sendControllerError(res, error);
   }
 };

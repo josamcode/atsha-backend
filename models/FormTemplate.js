@@ -111,6 +111,25 @@ const tableColumnSchema = new mongoose.Schema({
   id: false
 });
 
+const footerSocialLinkSchema = new mongoose.Schema({
+  id: {
+    type: String,
+    trim: true
+  },
+  type: {
+    type: String,
+    enum: ['website', 'email', 'facebook', 'instagram', 'linkedin', 'youtube', 'whatsapp', 'telegram', 'x', 'tiktok', 'snapchat', 'discord', 'pinterest', 'github'],
+    default: 'website'
+  },
+  url: {
+    type: String,
+    trim: true
+  }
+}, {
+  _id: false,
+  id: false
+});
+
 const sectionSchema = new mongoose.Schema({
   id: {
     type: String,
@@ -304,6 +323,7 @@ const formTemplateSchema = new mongoose.Schema({
         default: 'default'
       },
       height: { type: Number, default: 80 },
+      logoSize: { type: Number, default: 64 },
       backgroundColor: { type: String, default: '#ffffff' },
       textColor: { type: String, default: '#000000' },
       fontSize: { type: Number, default: 16 },
@@ -333,10 +353,27 @@ const formTemplateSchema = new mongoose.Schema({
       enabled: { type: Boolean, default: true },
       showPageNumbers: { type: Boolean, default: true },
       showCompanyInfo: { type: Boolean, default: true },
+      showQRCode: { type: Boolean, default: false },
+      showPhoneNumber: { type: Boolean, default: false },
+      showSocialIcons: { type: Boolean, default: false },
+      qrCodePosition: {
+        type: String,
+        enum: ['left', 'center', 'right'],
+        default: 'center'
+      },
+      qrCodeSize: { type: Number, default: 84 },
+      template: {
+        type: String,
+        enum: ['classic', 'centered', 'contact', 'minimal'],
+        default: 'classic'
+      },
       height: { type: Number, default: 50 },
       backgroundColor: { type: String, default: '#f9fafb' },
       textColor: { type: String, default: '#6b7280' },
       fontSize: { type: Number, default: 8 },
+      phoneNumber: String,
+      qrCodeValue: String,
+      socialLinks: [footerSocialLinkSchema],
       content: {
         en: String,
         ar: String
@@ -347,6 +384,9 @@ const formTemplateSchema = new mongoose.Schema({
       primaryColor: { type: String, default: '#d4b900' },
       secondaryColor: { type: String, default: '#b51c20' },
       logoUrl: String,
+      watermarkUrl: String,
+      watermarkSize: { type: Number, default: 55 },
+      watermarkOpacity: { type: Number, default: 5 },
       companyName: {
         en: String,
         ar: String

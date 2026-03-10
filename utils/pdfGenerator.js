@@ -1,6 +1,17 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const QRCode = require('qrcode');
+
+const clampNumber = (value, fallback, min, max) => {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, numericValue));
+};
 
 class PDFGenerator {
   constructor() {
@@ -29,6 +40,7 @@ class PDFGenerator {
           en: templateBranding.companyAddress?.en || organizationBranding.legalName || organizationDisplayName,
           ar: templateBranding.companyAddress?.ar || organizationBranding.legalName || organizationDisplayName
         },
+        watermarkUrl: templateBranding.watermarkUrl || organizationBranding.watermarkUrl,
         companyPhone: templateBranding.companyPhone || organizationBranding.supportPhone,
         companyEmail: templateBranding.companyEmail || organizationBranding.supportEmail
       }
@@ -51,7 +63,7 @@ class PDFGenerator {
   }
 
   async generateFormPDF(formInstance, template, user, language = 'en', options = {}) {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       try {
         // Get layout configuration from template
         const layout = template.layout || {};
@@ -128,7 +140,7 @@ class PDFGenerator {
         // Footer (if enabled)
         const footerConfig = pdfStyle.footer || {};
         if (footerConfig.enabled !== false) {
-          this.addFooter(doc, isRTL, pdfStyle, language, margins);
+          await this.addFooter(doc, isRTL, pdfStyle, language, margins);
         }
 
         doc.end();
@@ -502,14 +514,41 @@ class PDFGenerator {
     }
   }
 
-  addFooter(doc, isRTL, pdfStyle, language, margins) {
+  async addFooter(doc, isRTL, pdfStyle, language, margins) {
     const footerConfig = pdfStyle.footer || {};
     const branding = pdfStyle.branding || {};
-    const footerHeight = footerConfig.height || 50;
+    const showQRCode = footerConfig.showQRCode === true && String(footerConfig.qrCodeValue || '').trim();
+    const qrCodeValue = String(footerConfig.qrCodeValue || '').trim();
+    const footerTemplate = ['classic', 'centered', 'contact', 'minimal'].includes(footerConfig.template)
+      ? footerConfig.template
+      : 'classic';
+    const qrCodePosition = footerTemplate === 'centered'
+      ? 'center'
+      : (footerConfig.qrCodePosition === 'left' ? 'left' : 'right');
+    const qrCodeSize = showQRCode ? clampNumber(footerConfig.qrCodeSize, 40, 32, 96) : 0;
+    const qrCodeBuffer = showQRCode
+      ? await QRCode.toBuffer(qrCodeValue, { margin: 1, width: Math.max(120, qrCodeSize * 3) })
+      : null;
+    const qrCodeGap = qrCodeBuffer ? 14 : 0;
+    const minimumHeight = qrCodeBuffer
+      ? (footerTemplate === 'centered' ? qrCodeSize + 70 : 72)
+      : 50;
+    const footerHeight = Math.max(footerConfig.height || 50, minimumHeight);
     const footerBgColor = footerConfig.backgroundColor || '#f9fafb';
     const footerTextColor = footerConfig.textColor || '#6b7280';
     const footerFontSize = footerConfig.fontSize || 8;
     const pages = doc.bufferedPageRange();
+    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'atsha';
+    const footerContent = footerConfig.content?.[language] || footerConfig.content?.en ||
+      `${companyName} Restaurant Management System`;
+    const phoneNumber = footerConfig.phoneNumber || branding.companyPhone || '';
+    const socialLinks = footerConfig.showSocialIcons === true && Array.isArray(footerConfig.socialLinks)
+      ? footerConfig.socialLinks.filter((link) => link?.url)
+      : [];
+    const footerExtras = [
+      footerConfig.showPhoneNumber === true && phoneNumber ? phoneNumber : null,
+      socialLinks.length > 0 ? socialLinks.map((link) => link.url).join(' | ') : null
+    ].filter(Boolean).join(' | ');
 
     for (let i = 0; i < pages.count; i++) {
       doc.switchToPage(i);
@@ -519,34 +558,107 @@ class PDFGenerator {
         doc.page.width - margins.left - margins.right, footerHeight)
         .fill(footerBgColor);
 
-      let footerY = doc.page.height - margins.bottom - footerHeight + 10;
+      const footerTop = doc.page.height - margins.bottom - footerHeight;
+      if (footerTemplate === 'centered') {
+        let footerY = footerTop + 8;
+        const contentWidth = doc.page.width - margins.left - margins.right;
+
+        if (qrCodeBuffer) {
+          const qrCodeX = margins.left + (contentWidth - qrCodeSize) / 2;
+          doc.image(qrCodeBuffer, qrCodeX, footerY, {
+            fit: [qrCodeSize, qrCodeSize]
+          });
+          footerY += qrCodeSize + 8;
+        }
+
+        if (footerConfig.showPageNumbers !== false) {
+          const pageText = isRTL
+            ? `\u0635\u0641\u062d\u0629 ${i + 1} \u0645\u0646 ${pages.count}`
+            : `Page ${i + 1} of ${pages.count}`;
+
+          doc.fontSize(footerFontSize)
+            .fillColor(footerTextColor)
+            .text(pageText, margins.left, footerY, {
+              align: 'center',
+              width: contentWidth
+            });
+          footerY += 13;
+        }
+
+        if (footerConfig.showCompanyInfo !== false) {
+          doc.fontSize(footerFontSize)
+            .fillColor(footerTextColor)
+            .text(footerContent, margins.left, footerY, {
+              align: 'center',
+              width: contentWidth
+            });
+          footerY += 11;
+        }
+
+        if (footerExtras) {
+          doc.fontSize(Math.max(footerFontSize - 1, 7))
+            .fillColor(footerTextColor)
+            .text(footerExtras, margins.left, footerY, {
+              align: 'center',
+              width: contentWidth
+            });
+        }
+
+        continue;
+      }
+
+      const qrCodeX = qrCodeBuffer
+        ? (qrCodePosition === 'left'
+          ? margins.left + 10
+          : doc.page.width - margins.right - qrCodeSize - 10)
+        : null;
+      const qrCodeY = qrCodeBuffer ? footerTop + (footerHeight - qrCodeSize) / 2 : null;
+      const textX = qrCodeBuffer && qrCodePosition === 'left'
+        ? margins.left + qrCodeSize + qrCodeGap
+        : margins.left;
+      const textWidth = qrCodeBuffer
+        ? doc.page.width - margins.right - textX - (qrCodePosition === 'right' ? qrCodeSize + qrCodeGap : 0)
+        : doc.page.width - margins.left - margins.right;
+      let footerY = footerTop + 8;
+
+      if (qrCodeBuffer) {
+        doc.image(qrCodeBuffer, qrCodeX, qrCodeY, {
+          fit: [qrCodeSize, qrCodeSize]
+        });
+      }
 
       // Page numbers (if enabled)
       if (footerConfig.showPageNumbers !== false) {
         const pageText = isRTL
-          ? `صفحة ${i + 1} من ${pages.count}`
+          ? `\u0635\u0641\u062d\u0629 ${i + 1} \u0645\u0646 ${pages.count}`
           : `Page ${i + 1} of ${pages.count}`;
 
         doc.fontSize(footerFontSize)
           .fillColor(footerTextColor)
-          .text(pageText, margins.left, footerY, {
+          .text(pageText, textX, footerY, {
             align: 'center',
-            width: doc.page.width - margins.left - margins.right
+            width: textWidth
           });
-        footerY += 15;
+        footerY += 13;
       }
 
       // Company info (if enabled)
       if (footerConfig.showCompanyInfo !== false) {
-        const companyName = branding.companyName?.[language] || branding.companyName?.en || 'atsha';
-        const footerContent = footerConfig.content?.[language] || footerConfig.content?.en ||
-          `${companyName} Restaurant Management System`;
-
         doc.fontSize(footerFontSize)
           .fillColor(footerTextColor)
-          .text(footerContent, margins.left, footerY, {
+          .text(footerContent, textX, footerY, {
             align: 'center',
-            width: doc.page.width - margins.left - margins.right
+            width: textWidth
+          });
+        footerY += 11;
+      }
+
+      if (footerExtras) {
+        doc.fontSize(Math.max(footerFontSize - 1, 7))
+          .fillColor(footerTextColor)
+          .text(footerExtras, textX, footerY, {
+            align: 'center',
+            width: textWidth
           });
       }
     }
