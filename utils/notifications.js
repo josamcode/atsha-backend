@@ -2,24 +2,27 @@ const Notification = require('../models/Notification');
 const User = require('../models/User');
 
 /**
- * Create a notification for admin users
- * @param {Object} options - Notification options
- * @param {String} options.type - Notification type
- * @param {Object} options.title - Notification title {en: string, ar: string}
- * @param {Object} options.message - Notification message {en: string, ar: string}
- * @param {Object} options.data - Additional data for the notification
+ * Create a notification for organization admin users.
+ * Pass organizationId to keep recipients isolated to one tenant.
  */
-const createNotification = async ({ type, title, message, data = {} }) => {
+const createNotification = async ({ type, title, message, data = {}, organizationId = null }) => {
   try {
-    // Find all admin users
-    const adminUsers = await User.find({ role: 'admin', isActive: true }).select('_id');
+    const adminQuery = {
+      isActive: true,
+      role: { $in: ['admin', 'organization_admin'] }
+    };
+
+    if (organizationId) {
+      adminQuery.organizationId = organizationId;
+    }
+
+    const adminUsers = await User.find(adminQuery).select('_id organizationId').lean();
 
     if (adminUsers.length === 0) {
       console.log('No admin users found to send notification');
       return;
     }
 
-    // Ensure title and message are objects with en and ar
     const titleObj = typeof title === 'string'
       ? { en: title, ar: title }
       : { en: title.en || '', ar: title.ar || '' };
@@ -28,8 +31,8 @@ const createNotification = async ({ type, title, message, data = {} }) => {
       ? { en: message, ar: message }
       : { en: message.en || '', ar: message.ar || '' };
 
-    // Create notifications for all admins
-    const notifications = adminUsers.map(admin => ({
+    const notifications = adminUsers.map((admin) => ({
+      organizationId: organizationId || admin.organizationId || null,
       recipient: admin._id,
       type,
       title: titleObj,
@@ -38,14 +41,12 @@ const createNotification = async ({ type, title, message, data = {} }) => {
     }));
 
     await Notification.insertMany(notifications);
-    console.log(`✅ Created ${notifications.length} notification(s) for admins: ${type}`);
+    console.log(`Created ${notifications.length} notification(s) for admin recipients: ${type}`);
   } catch (error) {
     console.error('Error creating notification:', error);
-    // Don't throw error to prevent breaking the main flow
   }
 };
 
 module.exports = {
   createNotification
 };
-

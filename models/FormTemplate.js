@@ -16,8 +16,12 @@ const fieldSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['text', 'textarea', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
+    enum: ['text', 'textarea', 'static_text', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
     required: true
+  },
+  defaultValue: {
+    en: String,
+    ar: String
   },
   options: [{
     en: String,
@@ -75,6 +79,38 @@ const fieldSchema = new mongoose.Schema({
   }
 });
 
+const tableColumnBaseDefinition = {
+  id: String,
+  label: { en: String, ar: String },
+  fieldKey: String,
+  fieldType: {
+    type: String,
+    enum: ['text', 'textarea', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
+    default: 'text'
+  },
+  width: { type: String, default: 'auto' },
+  alignment: { type: String, enum: ['left', 'center', 'right'], default: 'left' },
+  headerStyle: {
+    backgroundColor: String,
+    textColor: String,
+    fontSize: Number,
+    bold: Boolean
+  }
+};
+
+const tableChildColumnSchema = new mongoose.Schema(tableColumnBaseDefinition, {
+  _id: false,
+  id: false
+});
+
+const tableColumnSchema = new mongoose.Schema({
+  ...tableColumnBaseDefinition,
+  children: [tableChildColumnSchema]
+}, {
+  _id: false,
+  id: false
+});
+
 const sectionSchema = new mongoose.Schema({
   id: {
     type: String,
@@ -121,24 +157,7 @@ const sectionSchema = new mongoose.Schema({
     // Table layout configuration
     table: {
       enabled: { type: Boolean, default: false },
-      columns: [{
-        id: String,
-        label: { en: String, ar: String },
-        fieldKey: String, // Which field goes in this column
-        fieldType: {
-          type: String,
-          enum: ['text', 'textarea', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
-          default: 'text'
-        }, // Field input type for this column
-        width: { type: String, default: 'auto' }, // auto, px, %
-        alignment: { type: String, enum: ['left', 'center', 'right'], default: 'left' },
-        headerStyle: {
-          backgroundColor: String,
-          textColor: String,
-          fontSize: Number,
-          bold: Boolean
-        }
-      }],
+      columns: [tableColumnSchema],
       dynamicRows: { type: Boolean, default: false }, // For repeating items
       rowSource: String, // Field key that contains array of items
       showHeader: { type: Boolean, default: true },
@@ -371,6 +390,11 @@ const formTemplateSchema = new mongoose.Schema({
       showSubmittedOn: { type: Boolean, default: true },
       showApprovedBy: { type: Boolean, default: true },
       showApprovalDate: { type: Boolean, default: true }
+    },
+    signature: {
+      enabled: { type: Boolean, default: true },
+      showPreparedBy: { type: Boolean, default: true },
+      showApprovedBy: { type: Boolean, default: true }
     }
   }
 }, {

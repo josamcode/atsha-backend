@@ -13,7 +13,11 @@ const {
   getPasswordResetRequestEmail,
   sendEmailToAdmins
 } = require('../utils/emailService');
-const { normalizeRole, toLegacyRole } = require('../utils/tenantConstants');
+const {
+  LEGACY_DEPARTMENTS,
+  normalizeRole,
+  toLegacyRole
+} = require('../utils/tenantConstants');
 
 const buildOrganizationScopedEmailQuery = (email, organizationId) => {
   const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -31,6 +35,127 @@ const buildOrganizationScopedEmailQuery = (email, organizationId) => {
       { organizationId: null }
     ]
   };
+};
+
+const buildOrganizationScopedLoginQuery = (email, organizationId) => (
+  buildOrganizationScopedEmailQuery(email, organizationId)
+);
+
+const titleizeDepartment = (value = 'other') => value
+  .split(/[-_]/)
+  .filter(Boolean)
+  .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+  .join(' ');
+
+const buildFallbackDepartments = () => LEGACY_DEPARTMENTS.map((code, index) => ({
+  code,
+  name: {
+    en: titleizeDepartment(code),
+    ar: titleizeDepartment(code)
+  },
+  isActive: true,
+  sortOrder: index,
+  isDefault: code === 'other'
+}));
+
+const getOrganizationDepartments = (organization) => {
+  const departments = Array.isArray(organization?.departments)
+    ? organization.departments.filter((entry) => entry?.code)
+    : [];
+
+  return departments.length > 0 ? departments : buildFallbackDepartments();
+};
+
+const slugifyOrganizationName = (value = '') => String(value || '')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '') || 'organization';
+
+const resolveAvailableOrganizationSlug = async (organizationName, preferredSlug) => {
+  const baseSlug = slugifyOrganizationName(preferredSlug || organizationName);
+  let candidateSlug = baseSlug;
+  let counter = 2;
+
+  while (await Organization.exists({ slug: candidateSlug })) {
+    candidateSlug = `${baseSlug}-${counter}`;
+    counter += 1;
+  }
+
+  return candidateSlug;
+};
+
+const findSingleActiveOrganization = async () => {
+  const organizations = await Organization.find({ status: 'active' })
+    .sort({ createdAt: 1 })
+    .limit(2)
+    .lean();
+
+  return organizations.length === 1 ? organizations[0] : null;
+};
+
+const resolveOrganizationForUser = async (user) => {
+  if (!user) {
+    return null;
+  }
+
+  if (user.organizationId) {
+    return Organization.findById(user.organizationId).lean();
+  }
+
+  return findSingleActiveOrganization();
+};
+
+const buildOrganizationRegistrationPayload = async ({ organizationName, organizationSlug, email }) => ({
+  name: organizationName,
+  slug: await resolveAvailableOrganizationSlug(organizationName, organizationSlug),
+  status: 'active',
+  plan: 'standard',
+  locale: 'en',
+  timezone: 'Africa/Cairo',
+  branding: {
+    displayName: organizationName,
+    shortName: organizationName,
+    legalName: organizationName,
+    supportEmail: String(email || '').trim().toLowerCase(),
+    emailFromName: organizationName
+  }
+});
+
+const findLoginUserWithoutOrganization = async (email, password) => {
+  const users = await User.find({
+    email: String(email || '').trim().toLowerCase()
+  })
+    .select('+password')
+    .limit(20);
+
+  if (users.length === 0) {
+    return { user: null, organization: null, error: 'not_found' };
+  }
+
+  const matchedUsers = [];
+  for (const candidateUser of users) {
+    const isMatch = await candidateUser.comparePassword(password);
+    if (isMatch) {
+      matchedUsers.push(candidateUser);
+    }
+  }
+
+  if (matchedUsers.length === 0) {
+    return { user: null, organization: null, error: 'not_found' };
+  }
+
+  if (matchedUsers.length > 1) {
+    return { user: null, organization: null, error: 'ambiguous' };
+  }
+
+  const user = matchedUsers[0];
+  const organization = await resolveOrganizationForUser(user);
+  if (!organization) {
+    return { user: null, organization: null, error: 'organization_required' };
+  }
+
+  return { user, organization, error: null };
 };
 
 const buildScopedUserQuery = (userId, organizationId) => {
@@ -63,7 +188,8 @@ const formatOrganization = (organization) => {
     locale: organization.locale,
     timezone: organization.timezone,
     branding: organization.branding || {},
-    featureFlags: organization.featureFlags || {}
+    featureFlags: organization.featureFlags || {},
+    departments: getOrganizationDepartments(organization)
   };
 };
 
@@ -231,16 +357,105 @@ exports.register = async (req, res) => {
   }
 };
 
+// @desc    Register a new organization with its first admin user
+// @route   POST /api/auth/register-organization
+// @access  Public
+exports.registerOrganization = async (req, res) => {
+  try {
+    const {
+      organizationName,
+      organizationSlug,
+      name,
+      email,
+      password,
+      phone,
+      languagePreference
+    } = req.body;
+
+    if (!organizationName || !name || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide organization name, admin name, email, and password'
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters'
+      });
+    }
+
+    let organization = null;
+
+    try {
+      organization = await Organization.create(
+        await buildOrganizationRegistrationPayload({
+          organizationName,
+          organizationSlug,
+          email
+        })
+      );
+
+      const user = await User.create({
+        organizationId: organization._id,
+        name,
+        email,
+        password,
+        phone,
+        role: 'organization_admin',
+        department: 'management',
+        departments: [],
+        languagePreference: languagePreference || 'en',
+        leaveBalance: organization.leaveSettings?.defaultAnnualBalance || 0
+      });
+
+      await Organization.updateOne(
+        { _id: organization._id },
+        { $set: { createdBy: user._id } }
+      );
+
+      organization.createdBy = user._id;
+
+      const accessToken = generateAccessToken(user, organization);
+      const refreshToken = generateRefreshToken(user, organization);
+
+      await User.updateOne(
+        { _id: user._id },
+        { $set: { refreshToken } }
+      );
+
+      user.refreshToken = refreshToken;
+
+      res.status(201).json(buildAuthResponse(user, organization, {
+        accessToken,
+        refreshToken
+      }));
+    } catch (error) {
+      if (organization?._id) {
+        await Organization.deleteOne({ _id: organization._id });
+      }
+
+      throw error;
+    }
+  } catch (error) {
+    const statusCode = error.code === 11000 || error.name === 'ValidationError' ? 400 : 500;
+
+    res.status(statusCode).json({
+      success: false,
+      message: error.code === 11000
+        ? 'Organization slug already exists'
+        : error.message
+    });
+  }
+};
+
 // @desc    Login user
 // @route   POST /api/auth/login
 // @access  Public
 exports.login = async (req, res) => {
   try {
-    const organization = getActiveOrganization(req, res);
-    if (!organization) {
-      return;
-    }
-
+    let organization = req.organization || null;
     const { email, password } = req.body;
 
     if (!email || !password) {
@@ -250,9 +465,50 @@ exports.login = async (req, res) => {
       });
     }
 
-    const user = await User.findOne(
-      buildOrganizationScopedEmailQuery(email, organization._id)
-    ).select('+password');
+    let user = null;
+
+    if (organization) {
+      organization = getActiveOrganization(req, res);
+      if (!organization) {
+        return;
+      }
+
+      user = await User.findOne(
+        buildOrganizationScopedLoginQuery(email, organization._id)
+      ).select('+password');
+
+      if (user) {
+        const isMatch = await user.comparePassword(password);
+        if (!isMatch) {
+          user = null;
+        }
+      }
+    } else {
+      const loginLookup = await findLoginUserWithoutOrganization(email, password);
+      if (loginLookup.error === 'ambiguous') {
+        return res.status(409).json({
+          success: false,
+          message: 'Multiple organizations matched this account. Please provide an organization slug.'
+        });
+      }
+
+      if (loginLookup.error === 'organization_required') {
+        return res.status(400).json({
+          success: false,
+          message: 'Unable to resolve organization for this account'
+        });
+      }
+
+      user = loginLookup.user;
+      organization = loginLookup.organization;
+    }
+
+    if (organization?.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: 'Organization is not active'
+      });
+    }
 
     if (!user) {
       return res.status(401).json({
@@ -269,14 +525,6 @@ exports.login = async (req, res) => {
       return res.status(401).json({
         success: false,
         message: 'Your account has been deactivated'
-      });
-    }
-
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
       });
     }
 

@@ -8,12 +8,54 @@ class PDFGenerator {
     this.arabicFontPath = path.join(__dirname, '../fonts/NotoSansArabic-Regular.ttf');
   }
 
-  async generateFormPDF(formInstance, template, user, language = 'en') {
+  buildPdfStyle(template = {}, organization = null) {
+    const templatePdfStyle = template.pdfStyle || {};
+    const templateBranding = templatePdfStyle.branding || {};
+    const organizationBranding = organization?.branding || {};
+    const organizationDisplayName = organizationBranding.displayName || organization?.name || 'atsha';
+
+    return {
+      ...templatePdfStyle,
+      branding: {
+        ...templateBranding,
+        primaryColor: templateBranding.primaryColor || organizationBranding.primaryColor || templatePdfStyle.colors?.primary || '#d4b900',
+        secondaryColor: templateBranding.secondaryColor || organizationBranding.secondaryColor || '#b51c20',
+        logoUrl: templateBranding.logoUrl || organizationBranding.logoUrl,
+        companyName: {
+          en: templateBranding.companyName?.en || organizationDisplayName,
+          ar: templateBranding.companyName?.ar || organizationDisplayName
+        },
+        companyAddress: {
+          en: templateBranding.companyAddress?.en || organizationBranding.legalName || organizationDisplayName,
+          ar: templateBranding.companyAddress?.ar || organizationBranding.legalName || organizationDisplayName
+        },
+        companyPhone: templateBranding.companyPhone || organizationBranding.supportPhone,
+        companyEmail: templateBranding.companyEmail || organizationBranding.supportEmail
+      }
+    };
+  }
+
+  getDepartmentLabel(organization, departmentCode, language = 'en') {
+    const normalizedCode = String(departmentCode || '').trim().toLowerCase();
+    const department = (organization?.departments || []).find((entry) => entry.code === normalizedCode);
+
+    if (department?.name?.[language]) {
+      return department.name[language];
+    }
+
+    if (department?.name?.en) {
+      return department.name.en;
+    }
+
+    return departmentCode || '-';
+  }
+
+  async generateFormPDF(formInstance, template, user, language = 'en', options = {}) {
     return new Promise((resolve, reject) => {
       try {
         // Get layout configuration from template
         const layout = template.layout || {};
-        const pdfStyle = template.pdfStyle || {};
+        const pdfStyle = this.buildPdfStyle(template, options.organization || null);
         const pageSize = layout.pageSize || 'A4';
         const orientation = layout.orientation || 'portrait';
         const margins = layout.margins || { top: 50, right: 50, bottom: 50, left: 50 };
@@ -37,7 +79,6 @@ class PDFGenerator {
 
         const isRTL = language === 'ar';
         const title = template.title[language] || template.title.en;
-        const description = template.description?.[language] || template.description?.en || '';
 
         // Set initial position with margins
         doc.x = margins.left;
@@ -50,7 +91,7 @@ class PDFGenerator {
         }
 
         // General Information
-        this.addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins);
+        this.addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins, options.organization || null);
         doc.moveDown();
 
         // Form Sections - Use sectionOrder if available
@@ -165,7 +206,12 @@ class PDFGenerator {
     doc.y = margins.top + headerHeight + 10;
   }
 
-  addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins) {
+  addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins, organization = null) {
+    const metadataConfig = pdfStyle.metadata || {};
+    if (metadataConfig.enabled === false) {
+      return;
+    }
+
     const fontSize = pdfStyle.fontSize?.field || 10;
     const textColor = pdfStyle.colors?.text || '#000000';
 
@@ -173,30 +219,90 @@ class PDFGenerator {
 
     const labels = {
       en: {
+        formId: 'Form ID',
         date: 'Date',
-        filledBy: 'Filled By',
-        department: 'Department',
         shift: 'Shift',
-        status: 'Status'
+        department: 'Department',
+        filledBy: 'Filled By',
+        submittedOn: 'Submitted On',
+        approvedBy: 'Approved By',
+        approvalDate: 'Approval Date'
       },
       ar: {
+        formId: 'رقم النموذج',
         date: 'التاريخ',
-        filledBy: 'تم الملء بواسطة',
-        department: 'القسم',
         shift: 'الوردية',
-        status: 'الحالة'
+        department: 'القسم',
+        filledBy: 'تم الملء بواسطة',
+        submittedOn: 'تاريخ الإرسال',
+        approvedBy: 'تم الاعتماد بواسطة',
+        approvalDate: 'تاريخ الاعتماد'
       }
     };
 
     const lang = labels[language] || labels.en;
 
-    const infoLines = [
-      `${lang.date}: ${new Date(formInstance.date).toLocaleDateString()}`,
-      `${lang.filledBy}: ${user.name}`,
-      `${lang.department}: ${formInstance.department}`,
-      `${lang.shift}: ${formInstance.shift}`,
-      `${lang.status}: ${formInstance.status}`
-    ];
+    const formatDateValue = (value) => {
+      if (!value) {
+        return '-';
+      }
+
+      const locale = language === 'ar' ? 'ar-EG' : 'en-US';
+      return new Date(value).toLocaleDateString(locale, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      });
+    };
+
+    const translateShift = (shift) => {
+      if (!shift) {
+        return '-';
+      }
+
+      const shiftLabels = {
+        en: {
+          morning: 'Morning',
+          evening: 'Evening',
+          night: 'Night'
+        },
+        ar: {
+          morning: 'صباحي',
+          evening: 'مسائي',
+          night: 'ليلي'
+        }
+      };
+
+      const localized = shiftLabels[language]?.[shift];
+      return localized || shift;
+    };
+
+    const infoLines = [];
+
+    if (metadataConfig.showFormId !== false) {
+      infoLines.push(`${lang.formId}: #${String(formInstance._id || '').slice(-8) || '-'}`);
+    }
+    if (metadataConfig.showDate !== false) {
+      infoLines.push(`${lang.date}: ${formatDateValue(formInstance.date)}`);
+    }
+    if (metadataConfig.showShift !== false) {
+      infoLines.push(`${lang.shift}: ${translateShift(formInstance.shift)}`);
+    }
+    if (metadataConfig.showDepartment !== false) {
+      infoLines.push(`${lang.department}: ${this.getDepartmentLabel(organization, formInstance.department, language)}`);
+    }
+    if (metadataConfig.showFilledBy !== false) {
+      infoLines.push(`${lang.filledBy}: ${formInstance.filledBy?.name || user?.name || '-'}`);
+    }
+    if (metadataConfig.showSubmittedOn !== false) {
+      infoLines.push(`${lang.submittedOn}: ${formatDateValue(formInstance.createdAt)}`);
+    }
+    if (formInstance.approvedBy && metadataConfig.showApprovedBy !== false) {
+      infoLines.push(`${lang.approvedBy}: ${formInstance.approvedBy?.name || '-'}`);
+    }
+    if (formInstance.approvedBy && metadataConfig.showApprovalDate !== false) {
+      infoLines.push(`${lang.approvalDate}: ${formatDateValue(formInstance.approvalDate)}`);
+    }
 
     infoLines.forEach(line => {
       doc.text(line, margins.left, doc.y, {
@@ -283,7 +389,9 @@ class PDFGenerator {
         return;
       }
 
-      let displayValue = value !== undefined && value !== null ? value : '-';
+      let displayValue = value !== undefined && value !== null
+        ? value
+        : (field.defaultValue?.[language] || field.defaultValue?.en || field.defaultValue?.ar || '-');
 
       // Format boolean values
       if (field.type === 'boolean') {
@@ -309,6 +417,10 @@ class PDFGenerator {
         displayText = fieldLabel;
       } else if (showValue) {
         displayText = displayValue;
+      }
+
+      if (field.type === 'static_text' && showValue) {
+        displayText = showLabel ? `${fieldLabel}: ${displayValue}` : displayValue;
       }
 
       if (displayText) {

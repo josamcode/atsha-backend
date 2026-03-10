@@ -12,10 +12,10 @@ const UserMetadata = require('../models/UserMetadata');
  */
 const PROJECTIONS = {
   // Minimal fields for lists (fastest)
-  LIST: '_id name email role department departments isActive languagePreference image phone jobTitle',
+  LIST: '_id organizationId name email role department departments isActive languagePreference image phone jobTitle',
 
   // Basic user info (most common)
-  BASIC: '_id name email role department departments isActive languagePreference image phone jobTitle nationality idNumber createdAt',
+  BASIC: '_id organizationId name email role department departments isActive languagePreference image phone jobTitle nationality idNumber createdAt',
 
   // Full user info (excluding sensitive fields)
   FULL: '-password -refreshToken -resetPasswordToken -resetPasswordExpire',
@@ -24,19 +24,19 @@ const PROJECTIONS = {
   AUTH: '+password +refreshToken',
 
   // For dashboard/user profile
-  PROFILE: '_id name email role department departments isActive languagePreference image phone jobTitle nationality idNumber leaveBalance workDays workSchedule createdAt',
+  PROFILE: '_id organizationId name email role department departments isActive languagePreference image phone jobTitle nationality idNumber leaveBalance workDays workSchedule createdAt',
 
   // For search/autocomplete
-  SEARCH: '_id name email role department',
+  SEARCH: '_id organizationId name email role department',
 
   // For attendance/work schedule queries
-  SCHEDULE: '_id name email workDays workSchedule department',
+  SCHEDULE: '_id organizationId name email workDays workSchedule department',
 
   // For leave balance queries
-  LEAVE: '_id name email leaveBalance department',
+  LEAVE: '_id organizationId name email leaveBalance department',
 
   // For department filtering
-  DEPARTMENT: '_id name email role department departments'
+  DEPARTMENT: '_id organizationId name email role department departments'
 };
 
 /**
@@ -45,9 +45,9 @@ const PROJECTIONS = {
  * @param {String} projection - Projection type from PROJECTIONS
  * @returns {Promise<User>}
  */
-async function getUserById(userId, projection = 'FULL') {
+async function getUserById(userId, projection = 'FULL', filters = {}) {
   const fields = PROJECTIONS[projection] || PROJECTIONS.FULL;
-  return await User.findById(userId).select(fields);
+  return await User.findOne({ _id: userId, ...filters }).select(fields);
 }
 
 /**
@@ -92,8 +92,8 @@ async function getUserCount(query = {}) {
  * @param {Boolean} includeMetadata - Whether to include metadata
  * @returns {Promise<Object>}
  */
-async function getUserWithMetadata(userId, projection = 'FULL', includeMetadata = false) {
-  const user = await getUserById(userId, projection);
+async function getUserWithMetadata(userId, projection = 'FULL', includeMetadata = false, filters = {}) {
+  const user = await getUserById(userId, projection, filters);
 
   if (!user) {
     return null;
@@ -102,7 +102,13 @@ async function getUserWithMetadata(userId, projection = 'FULL', includeMetadata 
   const result = { user };
 
   if (includeMetadata) {
-    const metadata = await UserMetadata.findOne({ userId }).lean();
+    const metadataQuery = { userId };
+
+    if (filters.organizationId) {
+      metadataQuery.organizationId = filters.organizationId;
+    }
+
+    const metadata = await UserMetadata.findOne(metadataQuery).lean();
     result.metadata = metadata || null;
   }
 
@@ -117,8 +123,11 @@ async function getUserWithMetadata(userId, projection = 'FULL', includeMetadata 
  * @param {Number} limit - Result limit
  * @returns {Promise<Array>}
  */
-async function searchUsers(searchTerm, filters = {}, projection = 'SEARCH', limit = 50) {
+async function searchUsers(searchTerm, filters = {}, projection = 'SEARCH', options = {}) {
   const fields = PROJECTIONS[projection] || PROJECTIONS.SEARCH;
+  const normalizedOptions = typeof options === 'number'
+    ? { limit: options }
+    : (options || {});
   const query = {
     ...filters,
     $or: [
@@ -127,10 +136,21 @@ async function searchUsers(searchTerm, filters = {}, projection = 'SEARCH', limi
     ]
   };
 
-  return await User.find(query)
-    .select(fields)
-    .limit(limit)
-    .lean(); // Use lean() for read-only queries (faster)
+  let queryBuilder = User.find(query).select(fields);
+
+  if (normalizedOptions.sort) {
+    queryBuilder = queryBuilder.sort(normalizedOptions.sort);
+  }
+
+  if (normalizedOptions.skip) {
+    queryBuilder = queryBuilder.skip(parseInt(normalizedOptions.skip, 10));
+  }
+
+  if (normalizedOptions.limit) {
+    queryBuilder = queryBuilder.limit(parseInt(normalizedOptions.limit, 10));
+  }
+
+  return await queryBuilder.lean();
 }
 
 /**
@@ -141,13 +161,17 @@ async function searchUsers(searchTerm, filters = {}, projection = 'SEARCH', limi
  * @returns {Promise<Object>}
  */
 async function getUsersByDepartment(departments, options = {}, projection = 'LIST') {
-  const { page = 1, limit = 20, sort = { name: 1 } } = options;
+  const { page = 1, limit = 20, sort = { name: 1 }, organizationId } = options;
   const skip = (page - 1) * limit;
   const fields = PROJECTIONS[projection] || PROJECTIONS.LIST;
 
   const query = Array.isArray(departments)
     ? { department: { $in: departments }, isActive: true }
     : { department: departments, isActive: true };
+
+  if (organizationId) {
+    query.organizationId = organizationId;
+  }
 
   const [users, total] = await Promise.all([
     User.find(query)

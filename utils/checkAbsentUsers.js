@@ -4,75 +4,100 @@ const { createNotification } = require('./notifications');
 const dateUtils = require('./dateUtils');
 
 /**
- * Check for absent users at the end of the day
- * This should be called daily (e.g., via cron job at end of day)
- * Uses Saudi Arabia timezone (Asia/Riyadh)
+ * Check for absent users at the end of the day.
+ * When organizationId is provided, the check is limited to that tenant.
  */
-const checkAbsentUsers = async () => {
+const checkAbsentUsers = async ({ organizationId = null } = {}) => {
   try {
-    // Use Saudi Arabia timezone for today's check
     const todayStart = dateUtils.getStartOfToday();
     const todayEnd = dateUtils.getEndOfToday();
+    const todayIso = todayStart.toISOString();
+    const dayName = dateUtils.getDayName(new Date());
 
-    // Get all active users (optimized - only select necessary fields)
-    const activeUsers = await User.find({ isActive: true })
-      .select('_id name email department workDays workSchedule')
-      .lean(); // Use lean() for read-only queries
+    const userQuery = { isActive: true };
+    if (organizationId) {
+      userQuery.organizationId = organizationId;
+    }
 
-    // Get all check-ins for today
-    const todayCheckins = await AttendanceLog.find({
+    const activeUsers = await User.find(userQuery)
+      .select('_id organizationId name department workDays')
+      .lean();
+
+    if (activeUsers.length === 0) {
+      return {
+        checkedUsers: 0,
+        absentUsers: 0
+      };
+    }
+
+    const checkinQuery = {
       type: 'checkin',
       timestamp: {
         $gte: todayStart,
         $lte: todayEnd
       }
-    }).select('userId');
+    };
 
-    const checkedInUserIds = new Set(todayCheckins.map(log => log.userId.toString()));
-
-    // Check each user
-    for (const user of activeUsers) {
-      if (!user.workDays || user.workDays.length === 0) {
-        continue; // Skip users without work days
-      }
-
-      // Get day name in Saudi Arabia timezone
-      const dayName = dateUtils.getDayName(new Date());
-
-      // Check if today is a work day for this user
-      if (!user.workDays.includes(dayName)) {
-        continue; // Not a work day, skip
-      }
-
-      // Check if user checked in today
-      if (!checkedInUserIds.has(user._id.toString())) {
-        // User is absent
-        await createNotification({
-          type: 'user_absent',
-          title: {
-            en: 'Employee Absent',
-            ar: 'غياب موظف'
-          },
-          message: {
-            en: `${user.name} did not check in today`,
-            ar: `${user.name} لم يسجل الحضور اليوم`
-          },
-          data: {
-            userId: user._id,
-            date: today.toISOString(),
-            department: user.department
-          }
-        });
-      }
+    if (organizationId) {
+      checkinQuery.organizationId = organizationId;
     }
 
-    console.log('✅ Absent users check completed');
+    const todayCheckins = await AttendanceLog.find(checkinQuery)
+      .select('userId')
+      .lean();
+
+    const checkedInUserIds = new Set(
+      todayCheckins.map((log) => String(log.userId))
+    );
+
+    let absentUsers = 0;
+
+    for (const user of activeUsers) {
+      if (!Array.isArray(user.workDays) || user.workDays.length === 0) {
+        continue;
+      }
+
+      if (!user.workDays.includes(dayName)) {
+        continue;
+      }
+
+      if (checkedInUserIds.has(String(user._id))) {
+        continue;
+      }
+
+      absentUsers += 1;
+
+      await createNotification({
+        organizationId: user.organizationId || organizationId || null,
+        type: 'user_absent',
+        title: {
+          en: 'Employee Absent',
+          ar: 'ط؛ظٹط§ط¨ ظ…ظˆط¸ظپ'
+        },
+        message: {
+          en: `${user.name} did not check in today`,
+          ar: `${user.name} ظ„ظ… ظٹط³ط¬ظ„ ط§ظ„ط­ط¶ظˆط± ط§ظ„ظٹظˆظ…`
+        },
+        data: {
+          userId: user._id,
+          date: todayIso,
+          department: user.department
+        }
+      });
+    }
+
+    console.log('Absent users check completed');
+
+    return {
+      checkedUsers: activeUsers.length,
+      absentUsers
+    };
   } catch (error) {
     console.error('Error checking absent users:', error);
+    throw error;
   }
 };
 
 module.exports = {
   checkAbsentUsers
 };
-

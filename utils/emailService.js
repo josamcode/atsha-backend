@@ -666,6 +666,43 @@ const getPasswordResetByAdminEmail = (resetData, language = 'en') => {
   };
 };
 
+// Invitation email
+const getInvitationEmail = (invitationData, language = 'en') => {
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'دعوة للانضمام إلى المؤسسة' : 'Invitation To Join Organization';
+  const organizationName = invitationData.organizationName || 'Organization';
+  const inviterName = invitationData.inviterName || 'Administrator';
+  const role = invitationData.role || 'employee';
+  const department = invitationData.department || 'other';
+  const inviteLink = invitationData.inviteLink;
+  const expiresAt = invitationData.expiresAt ? formatEmailDate(invitationData.expiresAt, language) : null;
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL ? `لقد تمت دعوتك للانضمام إلى ${organizationName}.` : `You have been invited to join ${organizationName}.`}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'الداعي:' : 'Invited By:'}</strong> ${inviterName}</p>
+      <p><strong>${isRTL ? 'الدور:' : 'Role:'}</strong> ${role}</p>
+      <p><strong>${isRTL ? 'القسم:' : 'Department:'}</strong> ${department}</p>
+      ${expiresAt ? `<p><strong>${isRTL ? 'تنتهي الدعوة في:' : 'Invitation Expires:'}</strong> ${expiresAt}</p>` : ''}
+    </div>
+    <p>${isRTL ? 'استخدم الرابط التالي لإكمال تفعيل حسابك.' : 'Use the link below to complete your account activation.'}</p>
+    <div style="text-align: center; margin: 30px 0;">
+      <a href="${inviteLink}" class="email-button">
+        ${isRTL ? 'قبول الدعوة' : 'Accept Invitation'}
+      </a>
+    </div>
+    <p style="font-size: 14px; color: #6b7280;">
+      ${isRTL ? `أو انسخ هذا الرابط في المتصفح: ${inviteLink}` : `Or copy and paste this link in your browser: ${inviteLink}`}
+    </p>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
 // Employee report email
 const getEmployeeReportEmail = (data, language = 'en') => {
   const isRTL = language === 'ar';
@@ -700,6 +737,7 @@ module.exports = {
   getPasswordResetEmail,
   getPasswordResetRequestEmail,
   getPasswordResetByAdminEmail,
+  getInvitationEmail,
   getEmployeeReportEmail
 };
 

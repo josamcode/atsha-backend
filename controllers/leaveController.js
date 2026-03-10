@@ -1,36 +1,278 @@
 const LeaveRequest = require('../models/LeaveRequest');
 const User = require('../models/User');
 const { createNotification } = require('../utils/notifications');
-const { sendEmailToAdmins, sendEmailToUser, getLeaveRequestedEmail, getLeaveApprovedEmail, getLeaveRejectedEmail } = require('../utils/emailService');
+const {
+  sendEmailToAdmins,
+  sendEmailToUser,
+  getLeaveRequestedEmail,
+  getLeaveApprovedEmail,
+  getLeaveRejectedEmail
+} = require('../utils/emailService');
+const { createAuditLog } = require('../utils/auditLogger');
+const { attachOrganizationId, buildTenantQuery } = require('../utils/tenantScope');
+const {
+  createHttpError,
+  ensureDepartmentAccess,
+  getManagedDepartments,
+  resolveScopedOrganization
+} = require('../utils/formAccess');
+const {
+  normalizeDepartmentCode,
+  normalizeRole
+} = require('../utils/tenantConstants');
+const {
+  getOrganizationDepartmentUserIds
+} = require('../utils/scopedUsers');
+
+const LEAVE_POPULATE = [
+  {
+    path: 'userId',
+    select: 'organizationId name email department languagePreference role leaveBalance'
+  },
+  {
+    path: 'approvedBy',
+    select: 'organizationId name email role'
+  }
+];
+
+const PRIVILEGED_LEAVE_ROLES = new Set([
+  'platform_admin',
+  'organization_admin'
+]);
+
+const SELF_ONLY_LEAVE_ROLES = new Set([
+  'employee',
+  'qr_manager'
+]);
+
+const LEAVE_TYPE_LABELS = {
+  vacation: { en: 'Vacation', ar: 'ط¥ط¬ط§ط²ط©' },
+  sick: { en: 'Sick', ar: 'ظ…ط±ط¶ظٹط©' },
+  permission: { en: 'Permission', ar: 'ط¥ط°ظ†' },
+  emergency: { en: 'Emergency', ar: 'ط·ط§ط±ط¦' },
+  unpaid: { en: 'Unpaid', ar: 'ط¨ط¯ظˆظ† ط±ط§طھط¨' },
+  other: { en: 'Other', ar: 'ط£ط®ط±ظ‰' }
+};
+
+const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
+  success: false,
+  message: error.message
+});
+
+const parseRequestedDates = (startDate, endDate) => {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw createHttpError(400, 'Please provide valid leave dates');
+  }
+
+  if (end < start) {
+    throw createHttpError(400, 'End date cannot be before start date');
+  }
+
+  return { start, end };
+};
+
+const calculateLeaveDays = ({ type, start, end, days }) => {
+  if (days !== undefined && days !== null && Number(days) > 0) {
+    return parseFloat(Number(days).toFixed(2));
+  }
+
+  const diffTime = Math.abs(end - start);
+
+  if (type === 'permission') {
+    return parseFloat((diffTime / (1000 * 60 * 60 * 8)).toFixed(2));
+  }
+
+  return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+};
+
+const resolveLeaveOrganization = async (req, fallbackOrganizationId = null) => (
+  resolveScopedOrganization(req, fallbackOrganizationId)
+);
+
+const populateLeave = async (leave) => leave.populate(LEAVE_POPULATE);
+
+const getOrganizationUserOrThrow = async (organizationId, userId, extraQuery = {}) => {
+  const user = await User.findOne({
+    _id: userId,
+    organizationId,
+    ...extraQuery
+  })
+    .select('_id organizationId name email department languagePreference role leaveBalance')
+    .lean();
+
+  if (!user) {
+    throw createHttpError(404, 'User not found');
+  }
+
+  return user;
+};
+
+const resolveLeaveUserScope = async (
+  req,
+  organization,
+  { requestedUserId = null, requestedDepartment = null } = {}
+) => {
+  const normalizedRole = normalizeRole(req.user.role);
+  const normalizedDepartment = requestedDepartment
+    ? normalizeDepartmentCode(requestedDepartment)
+    : null;
+  const currentUserId = req.user._id || req.user.id;
+
+  if (SELF_ONLY_LEAVE_ROLES.has(normalizedRole)) {
+    if (requestedUserId && String(requestedUserId) !== String(currentUserId)) {
+      throw createHttpError(403, 'You do not have access to other users leave requests');
+    }
+
+    if (
+      normalizedDepartment &&
+      normalizedDepartment !== normalizeDepartmentCode(req.user.department)
+    ) {
+      throw createHttpError(403, 'You do not have access to this department');
+    }
+
+    return {
+      userId: currentUserId,
+      userIds: [currentUserId]
+    };
+  }
+
+  if (normalizedRole === 'supervisor') {
+    if (normalizedDepartment) {
+      ensureDepartmentAccess(req.user, normalizedDepartment, 'You do not have access to this department');
+    }
+
+    if (requestedUserId) {
+      const scopedUser = await getOrganizationUserOrThrow(organization._id, requestedUserId);
+      ensureDepartmentAccess(req.user, scopedUser.department, 'You do not have access to this user');
+
+      if (
+        normalizedDepartment &&
+        normalizeDepartmentCode(scopedUser.department) !== normalizedDepartment
+      ) {
+        throw createHttpError(403, 'User does not belong to this department');
+      }
+
+      return {
+        userId: scopedUser._id,
+        userIds: [scopedUser._id]
+      };
+    }
+
+    if (normalizedDepartment) {
+      return {
+        userIds: await getOrganizationDepartmentUserIds(
+          organization._id,
+          [normalizedDepartment]
+        )
+      };
+    }
+
+    const managedDepartments = getManagedDepartments(req.user);
+    if (!managedDepartments) {
+      return {
+        userIds: null
+      };
+    }
+
+    return {
+      userIds: await getOrganizationDepartmentUserIds(
+        organization._id,
+        Array.from(managedDepartments)
+      )
+    };
+  }
+
+  if (PRIVILEGED_LEAVE_ROLES.has(normalizedRole)) {
+    if (requestedUserId) {
+      const extraQuery = normalizedDepartment
+        ? { department: normalizedDepartment }
+        : {};
+      const scopedUser = await getOrganizationUserOrThrow(
+        organization._id,
+        requestedUserId,
+        extraQuery
+      );
+
+      return {
+        userId: scopedUser._id,
+        userIds: [scopedUser._id]
+      };
+    }
+
+    if (normalizedDepartment) {
+      return {
+        userIds: await getOrganizationDepartmentUserIds(
+          organization._id,
+          [normalizedDepartment]
+        )
+      };
+    }
+
+    return {
+      userIds: null
+    };
+  }
+
+  throw createHttpError(403, 'You do not have access to leave data');
+};
+
+const applyUserScopeToLeaveQuery = (query, scope) => {
+  if (!scope || scope.userIds === null) {
+    return query;
+  }
+
+  if (scope.userId) {
+    query.userId = scope.userId;
+    return query;
+  }
+
+  query.userId = { $in: scope.userIds };
+  return query;
+};
+
+const ensureLeaveReadAccess = async (req, organization, leave) => {
+  const normalizedRole = normalizeRole(req.user.role);
+  const leaveOwnerId = leave.userId?._id || leave.userId;
+
+  if (PRIVILEGED_LEAVE_ROLES.has(normalizedRole)) {
+    return;
+  }
+
+  if (normalizedRole === 'supervisor') {
+    const leaveOwner = await getOrganizationUserOrThrow(organization._id, leaveOwnerId);
+    ensureDepartmentAccess(req.user, leaveOwner.department, 'You do not have access to this leave request');
+    return;
+  }
+
+  if (String(leaveOwnerId) !== String(req.user._id || req.user.id)) {
+    throw createHttpError(403, 'You do not have access to this leave request');
+  }
+};
+
+const getLeaveLabels = (type) => LEAVE_TYPE_LABELS[type] || {
+  en: type,
+  ar: type
+};
 
 // @desc    Get all leave requests
 // @route   GET /api/leaves
 // @access  Private
 exports.getLeaveRequests = async (req, res) => {
   try {
-    const { status, type, userId, dateFrom, dateTo } = req.query;
-
-    let query = {};
-
-    // Role-based filtering
-    if (req.user.role === 'employee') {
-      query.userId = req.user.id;
-    } else {
-      if (userId) query.userId = userId;
-
-      // Supervisors see only their departments
-      if (req.user.role === 'supervisor') {
-        const users = await User.find({
-          department: { $in: req.user.departments }
-        }).select('_id');
-        query.userId = { $in: users.map(u => u._id) };
-      }
-    }
+    const organization = await resolveLeaveOrganization(req);
+    const { status, type, userId, dateFrom, dateTo, department } = req.query;
+    const scope = await resolveLeaveUserScope(req, organization, {
+      requestedUserId: userId || null,
+      requestedDepartment: department || null
+    });
+    const query = applyUserScopeToLeaveQuery(buildTenantQuery(organization, {}), scope);
 
     if (status) query.status = status;
     if (type) query.type = type;
 
-    // Date range
     if (dateFrom || dateTo) {
       query.startDate = {};
       if (dateFrom) query.startDate.$gte = new Date(dateFrom);
@@ -38,9 +280,8 @@ exports.getLeaveRequests = async (req, res) => {
     }
 
     const leaves = await LeaveRequest.find(query)
-      .populate('userId', 'name email department')
-      .populate('approvedBy', 'name email')
-      .sort('-createdAt');
+      .populate(LEAVE_POPULATE)
+      .sort({ createdAt: -1 });
 
     res.json({
       success: true,
@@ -48,10 +289,7 @@ exports.getLeaveRequests = async (req, res) => {
       data: leaves
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -60,9 +298,7 @@ exports.getLeaveRequests = async (req, res) => {
 // @access  Private
 exports.getLeaveRequest = async (req, res) => {
   try {
-    const leave = await LeaveRequest.findById(req.params.id)
-      .populate('userId', 'name email department')
-      .populate('approvedBy', 'name email');
+    const leave = await LeaveRequest.findById(req.params.id);
 
     if (!leave) {
       return res.status(404).json({
@@ -71,33 +307,16 @@ exports.getLeaveRequest = async (req, res) => {
       });
     }
 
-    // Check access rights
-    if (req.user.role === 'employee' && leave.userId._id.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        message: 'You do not have access to this leave request'
-      });
-    }
-
-    if (req.user.role === 'supervisor') {
-      const user = await User.findById(leave.userId);
-      if (!req.user.departments.includes(user.department)) {
-        return res.status(403).json({
-          success: false,
-          message: 'You do not have access to this leave request'
-        });
-      }
-    }
+    const organization = await resolveLeaveOrganization(req, leave.organizationId);
+    await ensureLeaveReadAccess(req, organization, leave);
+    await populateLeave(leave);
 
     res.json({
       success: true,
       data: leave
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -106,6 +325,7 @@ exports.getLeaveRequest = async (req, res) => {
 // @access  Private
 exports.createLeaveRequest = async (req, res) => {
   try {
+    const organization = await resolveLeaveOrganization(req);
     const { type, startDate, endDate, reason, days } = req.body;
 
     if (!type || !startDate || !endDate || !reason) {
@@ -115,40 +335,16 @@ exports.createLeaveRequest = async (req, res) => {
       });
     }
 
-    // Validate dates
-    const start = new Date(startDate);
-    const end = new Date(endDate);
+    const { start, end } = parseRequestedDates(startDate, endDate);
+    const calculatedDays = calculateLeaveDays({ type, start, end, days });
 
-    if (end < start) {
-      return res.status(400).json({
-        success: false,
-        message: 'End date cannot be before start date'
-      });
-    }
-
-    // Calculate days if not provided (fallback)
-    let calculatedDays = days;
-    if (!calculatedDays || calculatedDays <= 0) {
-      const diffTime = Math.abs(end - start);
-
-      // For permission type, calculate days based on hours (8 hours = 1 day)
-      if (type === 'permission') {
-        const hours = diffTime / (1000 * 60 * 60);
-        calculatedDays = hours / 8; // Convert hours to days (assuming 8 hours work day)
-      } else {
-        // For other types, calculate full days
-        calculatedDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-      }
-    }
-
-    // Check for overlapping leave requests
-    const overlapping = await LeaveRequest.findOne({
+    const overlapping = await LeaveRequest.findOne(buildTenantQuery(organization, {
       userId: req.user.id,
       status: { $in: ['pending', 'approved'] },
       $or: [
         { startDate: { $lte: end }, endDate: { $gte: start } }
       ]
-    });
+    }));
 
     if (overlapping) {
       return res.status(400).json({
@@ -157,70 +353,76 @@ exports.createLeaveRequest = async (req, res) => {
       });
     }
 
-    const leave = await LeaveRequest.create({
+    const leave = await LeaveRequest.create(attachOrganizationId({
       userId: req.user.id,
       type,
       startDate: start,
       endDate: end,
       reason,
-      days: parseFloat(calculatedDays.toFixed(2)), // Ensure it's a number with 2 decimal places
+      days: calculatedDays,
       status: 'pending'
-    });
+    }, organization));
 
-    await leave.populate('userId', 'name email department');
+    await populateLeave(leave);
 
-    // Create notification for admins when leave is requested
-    const userName = leave.userId?.name || 'User';
-    const leaveTypeMap = {
-      vacation: { en: 'Vacation', ar: 'إجازة' },
-      sick: { en: 'Sick', ar: 'مرضية' },
-      permission: { en: 'Permission', ar: 'إذن' },
-      emergency: { en: 'Emergency', ar: 'طارئ' },
-      unpaid: { en: 'Unpaid', ar: 'بدون راتب' },
-      other: { en: 'Other', ar: 'أخرى' }
-    };
-    const leaveTypeEn = leaveTypeMap[type]?.en || type;
-    const leaveTypeAr = leaveTypeMap[type]?.ar || type;
+    const leaveLabels = getLeaveLabels(type);
+    const userName = leave.userId?.name || req.user.name || 'User';
 
     await createNotification({
+      organizationId: organization._id,
       type: 'leave_requested',
       title: {
         en: 'New Leave Request',
-        ar: 'طلب إجازة جديد'
+        ar: 'ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ط¬ط¯ظٹط¯'
       },
       message: {
-        en: `${userName} requested ${calculatedDays} day(s) of ${leaveTypeEn} leave`,
-        ar: `${userName} طلب ${calculatedDays} يوم من إجازة ${leaveTypeAr}`
+        en: `${userName} requested ${calculatedDays} day(s) of ${leaveLabels.en} leave`,
+        ar: `${userName} ط·ظ„ط¨ ${calculatedDays} ظٹظˆظ… ظ…ظ† ط¥ط¬ط§ط²ط© ${leaveLabels.ar}`
       },
       data: {
         leaveId: leave._id,
-        userId: leave.userId._id,
-        type: type,
+        userId: leave.userId?._id || leave.userId,
+        type,
         days: calculatedDays,
         startDate: start.toISOString(),
         endDate: end.toISOString()
       }
     });
 
-    // Send email to admins
-    await sendEmailToAdmins((language) => getLeaveRequestedEmail({
-      userName: userName,
-      leaveType: { en: leaveTypeEn, ar: leaveTypeAr },
-      days: calculatedDays,
-      startDate: start,
-      endDate: end,
-      department: leave.userId?.department || 'N/A'
-    }, language), leave.userId?.department);
+    await sendEmailToAdmins(
+      (language) => getLeaveRequestedEmail({
+        userName,
+        leaveType: leaveLabels,
+        days: calculatedDays,
+        startDate: start,
+        endDate: end,
+        department: leave.userId?.department || req.user.department || 'N/A'
+      }, language),
+      null,
+      organization._id
+    );
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'leave_request.created',
+      entityType: 'leave_request',
+      entityId: leave._id,
+      metadata: {
+        type,
+        days: leave.days,
+        startDate: leave.startDate,
+        endDate: leave.endDate
+      }
+    });
 
     res.status(201).json({
       success: true,
       data: leave
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -229,9 +431,7 @@ exports.createLeaveRequest = async (req, res) => {
 // @access  Private
 exports.updateLeaveRequest = async (req, res) => {
   try {
-    const { type, startDate, endDate, reason, days } = req.body;
-
-    let leave = await LeaveRequest.findById(req.params.id);
+    const leave = await LeaveRequest.findById(req.params.id);
 
     if (!leave) {
       return res.status(404).json({
@@ -240,61 +440,82 @@ exports.updateLeaveRequest = async (req, res) => {
       });
     }
 
-    // Admin can update any leave request, others can only update their own
-    const isAdmin = req.user.role === 'admin';
-    const isOwner = leave.userId.toString() === req.user.id;
+    const organization = await resolveLeaveOrganization(req, leave.organizationId);
+    const normalizedRole = normalizeRole(req.user.role);
+    const isPrivileged = PRIVILEGED_LEAVE_ROLES.has(normalizedRole);
+    const isOwner = String(leave.userId) === String(req.user._id || req.user.id);
 
-    if (!isAdmin && !isOwner) {
+    if (!isPrivileged && !isOwner) {
       return res.status(403).json({
         success: false,
         message: 'You do not have permission to update this leave request'
       });
     }
 
-    // Non-admin users can only update pending requests
-    if (!isAdmin && leave.status !== 'pending') {
+    if (!isPrivileged && leave.status !== 'pending') {
       return res.status(400).json({
         success: false,
         message: 'Cannot update a leave request that has been processed'
       });
     }
 
-    // Update fields
-    if (type) leave.type = type;
-    if (startDate) leave.startDate = new Date(startDate);
-    if (endDate) leave.endDate = new Date(endDate);
-    if (reason) leave.reason = reason;
+    const nextType = req.body.type !== undefined ? req.body.type : leave.type;
+    const nextReason = req.body.reason !== undefined ? req.body.reason : leave.reason;
+    const nextStartDate = req.body.startDate !== undefined ? req.body.startDate : leave.startDate;
+    const nextEndDate = req.body.endDate !== undefined ? req.body.endDate : leave.endDate;
+    const { start, end } = parseRequestedDates(nextStartDate, nextEndDate);
 
-    // Recalculate days if dates changed
-    if (startDate || endDate) {
-      const start = leave.startDate;
-      const end = leave.endDate;
-      const diffTime = Math.abs(end - start);
+    const overlapping = await LeaveRequest.findOne(buildTenantQuery(organization, {
+      _id: { $ne: leave._id },
+      userId: leave.userId,
+      status: { $in: ['pending', 'approved'] },
+      $or: [
+        { startDate: { $lte: end }, endDate: { $gte: start } }
+      ]
+    }));
 
-      // For permission type, calculate days based on hours (8 hours = 1 day)
-      if (leave.type === 'permission') {
-        const hours = diffTime / (1000 * 60 * 60);
-        leave.days = hours / 8; // Convert hours to days
-      } else {
-        // For other types, calculate full days
-        leave.days = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-      }
-    } else if (days) {
-      leave.days = days;
+    if (overlapping) {
+      return res.status(400).json({
+        success: false,
+        message: 'You already have a leave request for this period'
+      });
     }
 
+    leave.type = nextType;
+    leave.startDate = start;
+    leave.endDate = end;
+    leave.reason = nextReason;
+    leave.days = calculateLeaveDays({
+      type: nextType,
+      start,
+      end,
+      days: req.body.days !== undefined ? req.body.days : leave.days
+    });
+
     await leave.save();
-    await leave.populate('userId', 'name email department');
+    await populateLeave(leave);
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'leave_request.updated',
+      entityType: 'leave_request',
+      entityId: leave._id,
+      metadata: {
+        type: leave.type,
+        status: leave.status,
+        days: leave.days,
+        changedFields: Object.keys(req.body || {})
+      }
+    });
 
     res.json({
       success: true,
       data: leave
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -312,15 +533,15 @@ exports.deleteLeaveRequest = async (req, res) => {
       });
     }
 
-    // Only owner can delete
-    if (leave.userId.toString() !== req.user.id) {
+    const organization = await resolveLeaveOrganization(req, leave.organizationId);
+
+    if (String(leave.userId) !== String(req.user._id || req.user.id)) {
       return res.status(403).json({
         success: false,
         message: 'You do not have permission to delete this leave request'
       });
     }
 
-    // Can only delete pending requests
     if (leave.status !== 'pending') {
       return res.status(400).json({
         success: false,
@@ -330,15 +551,26 @@ exports.deleteLeaveRequest = async (req, res) => {
 
     await leave.deleteOne();
 
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'leave_request.deleted',
+      entityType: 'leave_request',
+      entityId: leave._id,
+      metadata: {
+        type: leave.type,
+        days: leave.days,
+        status: leave.status
+      }
+    });
+
     res.json({
       success: true,
       message: 'Leave request deleted successfully'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -356,7 +588,7 @@ exports.approveLeaveRequest = async (req, res) => {
       });
     }
 
-    let leave = await LeaveRequest.findById(req.params.id);
+    const leave = await LeaveRequest.findById(req.params.id);
 
     if (!leave) {
       return res.status(404).json({
@@ -365,18 +597,20 @@ exports.approveLeaveRequest = async (req, res) => {
       });
     }
 
-    // Check department access for supervisors
-    if (req.user.role === 'supervisor') {
-      const user = await User.findById(leave.userId);
-      if (!req.user.departments.includes(user.department)) {
-        return res.status(403).json({
-          success: false,
-          message: 'You do not have access to approve this leave request'
-        });
-      }
+    const organization = await resolveLeaveOrganization(req, leave.organizationId);
+    const normalizedRole = normalizeRole(req.user.role);
+    const leaveOwner = await getOrganizationUserOrThrow(organization._id, leave.userId);
+
+    if (normalizedRole === 'supervisor') {
+      ensureDepartmentAccess(
+        req.user,
+        leaveOwner.department,
+        'You do not have access to approve this leave request'
+      );
+    } else if (!PRIVILEGED_LEAVE_ROLES.has(normalizedRole)) {
+      throw createHttpError(403, 'You do not have access to approve this leave request');
     }
 
-    // Can only approve/reject pending requests
     if (leave.status !== 'pending') {
       return res.status(400).json({
         success: false,
@@ -390,87 +624,102 @@ exports.approveLeaveRequest = async (req, res) => {
     leave.approvalNotes = notes || '';
 
     await leave.save();
-    await leave.populate('userId', 'name email department languagePreference');
-    await leave.populate('approvedBy', 'name email');
 
-    // Update user's leave balance if approved
     if (status === 'approved') {
-      const user = await User.findById(leave.userId);
-      if (user.leaveBalance >= leave.days) {
+      const user = await User.findOne({
+        _id: leave.userId,
+        organizationId: organization._id
+      });
+
+      if (user && user.leaveBalance >= leave.days) {
         user.leaveBalance -= leave.days;
         await user.save();
       }
     }
 
-    // Create notification for admins when leave is approved/rejected
-    const userName = leave.userId?.name || 'User';
-    const leaveTypeMap = {
-      vacation: { en: 'Vacation', ar: 'إجازة' },
-      sick: { en: 'Sick', ar: 'مرضية' },
-      permission: { en: 'Permission', ar: 'إذن' },
-      emergency: { en: 'Emergency', ar: 'طارئ' },
-      unpaid: { en: 'Unpaid', ar: 'بدون راتب' },
-      other: { en: 'Other', ar: 'أخرى' }
-    };
-    const leaveTypeEn = leaveTypeMap[leave.type]?.en || leave.type;
-    const leaveTypeAr = leaveTypeMap[leave.type]?.ar || leave.type;
+    await populateLeave(leave);
+
+    const leaveLabels = getLeaveLabels(leave.type);
     const action = status === 'approved' ? 'approved' : 'rejected';
+    const userName = leave.userId?.name || 'User';
 
     await createNotification({
+      organizationId: organization._id,
       type: `leave_${action}`,
       title: {
         en: `Leave Request ${action === 'approved' ? 'Approved' : 'Rejected'}`,
-        ar: action === 'approved' ? 'تم الموافقة على طلب الإجازة' : 'تم رفض طلب الإجازة'
+        ar: action === 'approved'
+          ? 'طھظ… ط§ظ„ظ…ظˆط§ظپظ‚ط© ط¹ظ„ظ‰ ط·ظ„ط¨ ط§ظ„ط¥ط¬ط§ط²ط©'
+          : 'طھظ… ط±ظپط¶ ط·ظ„ط¨ ط§ظ„ط¥ط¬ط§ط²ط©'
       },
       message: {
-        en: `Leave request from ${userName} (${leave.days} day(s) ${leaveTypeEn}) has been ${action}`,
+        en: `Leave request from ${userName} (${leave.days} day(s) ${leaveLabels.en}) has been ${action}`,
         ar: action === 'approved'
-          ? `تم الموافقة على طلب إجازة من ${userName} (${leave.days} يوم ${leaveTypeAr})`
-          : `تم رفض طلب إجازة من ${userName} (${leave.days} يوم ${leaveTypeAr})`
+          ? `طھظ… ط§ظ„ظ…ظˆط§ظپظ‚ط© ط¹ظ„ظ‰ ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ظ…ظ† ${userName} (${leave.days} ظٹظˆظ… ${leaveLabels.ar})`
+          : `طھظ… ط±ظپط¶ ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ظ…ظ† ${userName} (${leave.days} ظٹظˆظ… ${leaveLabels.ar})`
       },
       data: {
         leaveId: leave._id,
-        userId: leave.userId._id,
-        approvedBy: leave.approvedBy._id,
+        userId: leave.userId?._id || leave.userId,
+        approvedBy: leave.approvedBy?._id || leave.approvedBy,
         type: leave.type,
         days: leave.days,
-        status: status
+        status
       }
     });
 
-    // Send email to user
     if (leave.userId?.email) {
-      const userLanguage = leave.userId?.languagePreference || 'ar';
+      const userLanguage = leave.userId.languagePreference || 'ar';
 
       if (status === 'approved') {
-        await sendEmailToUser(leave.userId.email, (language) => getLeaveApprovedEmail({
-          leaveType: { en: leaveTypeEn, ar: leaveTypeAr },
-          days: leave.days,
-          startDate: leave.startDate,
-          endDate: leave.endDate,
-          approvedBy: leave.approvedBy
-        }, language), userLanguage);
+        await sendEmailToUser(
+          leave.userId.email,
+          (language) => getLeaveApprovedEmail({
+            leaveType: leaveLabels,
+            days: leave.days,
+            startDate: leave.startDate,
+            endDate: leave.endDate,
+            approvedBy: leave.approvedBy
+          }, language),
+          userLanguage
+        );
       } else {
-        await sendEmailToUser(leave.userId.email, (language) => getLeaveRejectedEmail({
-          leaveType: { en: leaveTypeEn, ar: leaveTypeAr },
-          days: leave.days,
-          startDate: leave.startDate,
-          endDate: leave.endDate,
-          rejectedBy: leave.approvedBy,
-          rejectionNotes: notes || ''
-        }, language), userLanguage);
+        await sendEmailToUser(
+          leave.userId.email,
+          (language) => getLeaveRejectedEmail({
+            leaveType: leaveLabels,
+            days: leave.days,
+            startDate: leave.startDate,
+            endDate: leave.endDate,
+            rejectedBy: leave.approvedBy,
+            rejectionNotes: notes || ''
+          }, language),
+          userLanguage
+        );
       }
     }
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: `leave_request.${status}`,
+      entityType: 'leave_request',
+      entityId: leave._id,
+      metadata: {
+        type: leave.type,
+        days: leave.days,
+        approvalNotes: notes || '',
+        targetUserId: leave.userId?._id || leave.userId
+      }
+    });
 
     res.json({
       success: true,
       data: leave
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -479,7 +728,7 @@ exports.approveLeaveRequest = async (req, res) => {
 // @access  Private
 exports.cancelLeaveRequest = async (req, res) => {
   try {
-    let leave = await LeaveRequest.findById(req.params.id);
+    const leave = await LeaveRequest.findById(req.params.id);
 
     if (!leave) {
       return res.status(404).json({
@@ -488,15 +737,15 @@ exports.cancelLeaveRequest = async (req, res) => {
       });
     }
 
-    // Only owner can cancel
-    if (leave.userId.toString() !== req.user.id) {
+    const organization = await resolveLeaveOrganization(req, leave.organizationId);
+
+    if (String(leave.userId) !== String(req.user._id || req.user.id)) {
       return res.status(403).json({
         success: false,
         message: 'You do not have permission to cancel this leave request'
       });
     }
 
-    // Can only cancel pending requests
     if (leave.status !== 'pending') {
       return res.status(400).json({
         success: false,
@@ -506,17 +755,27 @@ exports.cancelLeaveRequest = async (req, res) => {
 
     leave.status = 'cancelled';
     await leave.save();
-    await leave.populate('userId', 'name email department');
+    await populateLeave(leave);
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'leave_request.cancelled',
+      entityType: 'leave_request',
+      entityId: leave._id,
+      metadata: {
+        type: leave.type,
+        days: leave.days
+      }
+    });
 
     res.json({
       success: true,
       data: leave
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -525,51 +784,42 @@ exports.cancelLeaveRequest = async (req, res) => {
 // @access  Private (Admin, Supervisor)
 exports.getLeaveStats = async (req, res) => {
   try {
+    const organization = await resolveLeaveOrganization(req);
     const { dateFrom, dateTo, department } = req.query;
+    const scope = await resolveLeaveUserScope(req, organization, {
+      requestedDepartment: department || null
+    });
+    const matchQuery = applyUserScopeToLeaveQuery(buildTenantQuery(organization, {}), scope);
 
-    let matchQuery = {};
-
-    // Date range
     if (dateFrom || dateTo) {
       matchQuery.startDate = {};
       if (dateFrom) matchQuery.startDate.$gte = new Date(dateFrom);
       if (dateTo) matchQuery.startDate.$lte = new Date(dateTo);
     }
 
-    // Department filter for supervisors
-    if (req.user.role === 'supervisor') {
-      const users = await User.find({
-        department: { $in: req.user.departments }
-      }).select('_id');
-      matchQuery.userId = { $in: users.map(u => u._id) };
-    } else if (department) {
-      const users = await User.find({ department }).select('_id');
-      matchQuery.userId = { $in: users.map(u => u._id) };
-    }
-
-    const stats = await LeaveRequest.aggregate([
-      { $match: matchQuery },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          totalDays: { $sum: '$days' }
+    const [stats, byType, totalRequests] = await Promise.all([
+      LeaveRequest.aggregate([
+        { $match: matchQuery },
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 },
+            totalDays: { $sum: '$days' }
+          }
         }
-      }
-    ]);
-
-    const byType = await LeaveRequest.aggregate([
-      { $match: matchQuery },
-      {
-        $group: {
-          _id: '$type',
-          count: { $sum: 1 },
-          totalDays: { $sum: '$days' }
+      ]),
+      LeaveRequest.aggregate([
+        { $match: matchQuery },
+        {
+          $group: {
+            _id: '$type',
+            count: { $sum: 1 },
+            totalDays: { $sum: '$days' }
+          }
         }
-      }
+      ]),
+      LeaveRequest.countDocuments(matchQuery)
     ]);
-
-    const totalRequests = await LeaveRequest.countDocuments(matchQuery);
 
     res.json({
       success: true,
@@ -580,10 +830,7 @@ exports.getLeaveStats = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -592,13 +839,27 @@ exports.getLeaveStats = async (req, res) => {
 // @access  Private
 exports.getMyLeaveBalance = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const organization = await resolveLeaveOrganization(req);
+    const user = await User.findOne({
+      _id: req.user.id,
+      organizationId: organization._id
+    })
+      .select('leaveBalance')
+      .lean();
 
-    // Get approved leaves
-    const approvedLeaves = await LeaveRequest.find({
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const approvedLeaves = await LeaveRequest.find(buildTenantQuery(organization, {
       userId: req.user.id,
       status: 'approved'
-    });
+    }))
+      .select('days')
+      .lean();
 
     const usedDays = approvedLeaves.reduce((sum, leave) => sum + leave.days, 0);
 
@@ -611,10 +872,6 @@ exports.getMyLeaveBalance = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
-

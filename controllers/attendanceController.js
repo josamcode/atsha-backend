@@ -5,56 +5,334 @@ const { createNotification } = require('../utils/notifications');
 const { checkAbsentUsers } = require('../utils/checkAbsentUsers');
 const logger = require('../utils/logger');
 const dateUtils = require('../utils/dateUtils');
+const { createAuditLog } = require('../utils/auditLogger');
+const { attachOrganizationId, buildTenantQuery } = require('../utils/tenantScope');
+const {
+  createHttpError,
+  ensureDepartmentAccess,
+  getManagedDepartments,
+  resolveScopedOrganization
+} = require('../utils/formAccess');
+const {
+  normalizeDepartmentCode,
+  normalizeRole
+} = require('../utils/tenantConstants');
+const {
+  getOrganizationDepartmentUserIds
+} = require('../utils/scopedUsers');
+
+const ATTENDANCE_POPULATE = [
+  {
+    path: 'userId',
+    select: 'organizationId name email department role'
+  },
+  {
+    path: 'tokenId',
+    select: 'organizationId sequenceNumber token status validFrom validTo usageCount'
+  }
+];
+
+const PRIVILEGED_ATTENDANCE_ROLES = new Set([
+  'platform_admin',
+  'organization_admin',
+  'qr_manager'
+]);
+
+const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
+  success: false,
+  message: error.message
+});
+
+const populateAttendanceLog = async (log) => log.populate(ATTENDANCE_POPULATE);
+
+const parsePagination = (page, limit) => {
+  const normalizedPage = Math.max(parseInt(page, 10) || 1, 1);
+  const normalizedLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+
+  return {
+    page: normalizedPage,
+    limit: normalizedLimit,
+    skip: (normalizedPage - 1) * normalizedLimit
+  };
+};
+
+const resolveAttendanceOrganization = async (req, fallbackOrganizationId = null) => (
+  resolveScopedOrganization(req, fallbackOrganizationId)
+);
+
+const getOrganizationUserOrThrow = async (organizationId, userId, extraQuery = {}) => {
+  const user = await User.findOne({
+    _id: userId,
+    organizationId,
+    ...extraQuery
+  })
+    .select('_id organizationId department')
+    .lean();
+
+  if (!user) {
+    throw createHttpError(404, 'User not found');
+  }
+
+  return user;
+};
+
+const resolveAttendanceUserScope = async (
+  req,
+  organization,
+  { requestedUserId = null, requestedDepartment = null } = {}
+) => {
+  const normalizedRole = normalizeRole(req.user.role);
+  const normalizedDepartment = requestedDepartment
+    ? normalizeDepartmentCode(requestedDepartment)
+    : null;
+  const currentUserId = req.user._id || req.user.id;
+
+  if (normalizedRole === 'employee') {
+    if (requestedUserId && String(requestedUserId) !== String(currentUserId)) {
+      throw createHttpError(403, 'You do not have access to other users attendance');
+    }
+
+    if (
+      normalizedDepartment &&
+      normalizedDepartment !== normalizeDepartmentCode(req.user.department)
+    ) {
+      throw createHttpError(403, 'You do not have access to this department');
+    }
+
+    return {
+      userId: currentUserId,
+      userIds: [currentUserId]
+    };
+  }
+
+  if (normalizedRole === 'supervisor') {
+    if (normalizedDepartment) {
+      ensureDepartmentAccess(req.user, normalizedDepartment, 'You do not have access to this department');
+    }
+
+    if (requestedUserId) {
+      const scopedUser = await getOrganizationUserOrThrow(organization._id, requestedUserId);
+      ensureDepartmentAccess(req.user, scopedUser.department, 'You do not have access to this user');
+
+      if (
+        normalizedDepartment &&
+        normalizeDepartmentCode(scopedUser.department) !== normalizedDepartment
+      ) {
+        throw createHttpError(403, 'User does not belong to this department');
+      }
+
+      return {
+        userId: scopedUser._id,
+        userIds: [scopedUser._id]
+      };
+    }
+
+    if (normalizedDepartment) {
+      return {
+        userIds: await getOrganizationDepartmentUserIds(
+          organization._id,
+          [normalizedDepartment]
+        )
+      };
+    }
+
+    const managedDepartments = getManagedDepartments(req.user);
+    if (!managedDepartments) {
+      return {
+        userIds: null
+      };
+    }
+
+    return {
+      userIds: await getOrganizationDepartmentUserIds(
+        organization._id,
+        Array.from(managedDepartments)
+      )
+    };
+  }
+
+  if (PRIVILEGED_ATTENDANCE_ROLES.has(normalizedRole)) {
+    if (requestedUserId) {
+      const extraQuery = normalizedDepartment
+        ? { department: normalizedDepartment }
+        : {};
+      const scopedUser = await getOrganizationUserOrThrow(
+        organization._id,
+        requestedUserId,
+        extraQuery
+      );
+
+      return {
+        userId: scopedUser._id,
+        userIds: [scopedUser._id]
+      };
+    }
+
+    if (normalizedDepartment) {
+      return {
+        userIds: await getOrganizationDepartmentUserIds(
+          organization._id,
+          [normalizedDepartment]
+        )
+      };
+    }
+
+    return {
+      userIds: null
+    };
+  }
+
+  throw createHttpError(403, 'You do not have access to attendance data');
+};
+
+const applyAttendanceUserScope = (query, scope) => {
+  if (!scope || scope.userIds === null) {
+    return query;
+  }
+
+  if (scope.userId) {
+    query.userId = scope.userId;
+    return query;
+  }
+
+  query.userId = { $in: scope.userIds };
+  return query;
+};
+
+const groupAttendanceByDate = (logs, limit) => {
+  const checkIns = logs
+    .filter((log) => log.type === 'checkin')
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const checkOuts = logs
+    .filter((log) => log.type === 'checkout')
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+  const groupedByDate = {};
+
+  checkIns.forEach((checkIn) => {
+    const date = dateUtils.getDateString(checkIn.timestamp);
+    if (!groupedByDate[date]) {
+      groupedByDate[date] = {
+        date,
+        checkin: null,
+        checkout: null
+      };
+    }
+
+    if (
+      !groupedByDate[date].checkin ||
+      new Date(checkIn.timestamp) < new Date(groupedByDate[date].checkin.timestamp)
+    ) {
+      groupedByDate[date].checkin = checkIn;
+    }
+  });
+
+  checkOuts.forEach((checkOut) => {
+    const correspondingCheckIn = checkIns
+      .filter((checkIn) => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
+
+    if (correspondingCheckIn) {
+      const checkInDate = dateUtils.getDateString(correspondingCheckIn.timestamp);
+
+      if (!groupedByDate[checkInDate]) {
+        groupedByDate[checkInDate] = {
+          date: checkInDate,
+          checkin: null,
+          checkout: null
+        };
+      }
+
+      if (
+        !groupedByDate[checkInDate].checkout ||
+        new Date(checkOut.timestamp) > new Date(groupedByDate[checkInDate].checkout.timestamp)
+      ) {
+        groupedByDate[checkInDate].checkout = checkOut;
+      }
+
+      return;
+    }
+
+    const date = dateUtils.getDateString(checkOut.timestamp);
+    if (!groupedByDate[date]) {
+      groupedByDate[date] = {
+        date,
+        checkin: null,
+        checkout: null
+      };
+    }
+
+    if (
+      !groupedByDate[date].checkout ||
+      new Date(checkOut.timestamp) > new Date(groupedByDate[date].checkout.timestamp)
+    ) {
+      groupedByDate[date].checkout = checkOut;
+    }
+  });
+
+  return Object.values(groupedByDate)
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+    .slice(0, limit);
+};
 
 // Auto-generate QR code (called by cron job or manually by admin)
 exports.generateQRCode = async (req, res) => {
   try {
-    // Get next sequence number
-    const sequenceNumber = await AttendanceToken.getNextSequence();
-
-    // Generate unique token
+    const organization = await resolveAttendanceOrganization(req);
+    const sequenceNumber = await AttendanceToken.getNextSequence(organization._id);
     const token = AttendanceToken.generateToken();
-
-    // Set validity from environment variable (default: 30 seconds)
-    const validitySeconds = parseInt(process.env.QR_TOKEN_VALIDITY_SECONDS) || 30;
+    const validitySeconds = parseInt(process.env.QR_TOKEN_VALIDITY_SECONDS, 10) || 30;
     const validityMs = validitySeconds * 1000;
     const validFrom = new Date();
     const validTo = new Date(validFrom.getTime() + validityMs);
 
-    logger.log(`🔑 Generating QR with validity: ${validitySeconds} seconds (validFrom: ${validFrom.toISOString()}, validTo: ${validTo.toISOString()})`);
-
-    // Create new QR token
-    const qrToken = await AttendanceToken.create({
+    const qrToken = await AttendanceToken.create(attachOrganizationId({
       token,
       validFrom,
       validTo,
       status: 'active',
       sequenceNumber,
-      createdBy: req.user?.id
-    });
+      createdBy: req.user?._id || req.user?.id
+    }, organization));
 
-    // Expire all previous active tokens
     await AttendanceToken.updateMany(
       {
+        organizationId: organization._id,
         _id: { $ne: qrToken._id },
         status: 'active'
       },
       { status: 'expired' }
     );
 
-    // Cleanup: Keep only last 10 QR codes
-    const tokensToKeep = await AttendanceToken.find()
+    const tokensToKeep = await AttendanceToken.find({
+      organizationId: organization._id
+    })
       .sort({ createdAt: -1 })
       .limit(10)
       .select('_id');
 
-    const idsToKeep = tokensToKeep.map(t => t._id);
-
     await AttendanceToken.deleteMany({
-      _id: { $nin: idsToKeep }
+      organizationId: organization._id,
+      _id: { $nin: tokensToKeep.map((tokenEntry) => tokenEntry._id) }
     });
 
-    logger.log(`✅ Generated QR #${sequenceNumber}, cleaned old tokens`);
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'attendance_token.created',
+      entityType: 'attendance_token',
+      entityId: qrToken._id,
+      metadata: {
+        sequenceNumber: qrToken.sequenceNumber,
+        validFrom: qrToken.validFrom,
+        validTo: qrToken.validTo
+      }
+    });
+
+    logger.log(
+      `Generated attendance QR #${sequenceNumber} for organization ${organization._id}`
+    );
 
     res.json({
       success: true,
@@ -64,22 +342,21 @@ exports.generateQRCode = async (req, res) => {
         validTo: qrToken.validTo,
         sequenceNumber: qrToken.sequenceNumber,
         usageCount: qrToken.usageCount || 0,
-        expiresIn: validitySeconds // seconds
+        expiresIn: validitySeconds
       }
     });
   } catch (error) {
     logger.error('Error generating QR code:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Get current active QR code (admin only)
+// Get current active QR code
 exports.getCurrentQR = async (req, res) => {
   try {
+    const organization = await resolveAttendanceOrganization(req);
     const currentQR = await AttendanceToken.findOne({
+      organizationId: organization._id,
       status: 'active',
       validTo: { $gt: new Date() }
     }).sort({ createdAt: -1 });
@@ -91,7 +368,6 @@ exports.getCurrentQR = async (req, res) => {
       });
     }
 
-    // Check if expired
     if (!currentQR.isValid()) {
       await currentQR.expire();
       return res.status(404).json({
@@ -115,20 +391,20 @@ exports.getCurrentQR = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error getting current QR:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Validate QR token (public endpoint - for checking if QR is valid)
+// Validate QR token (public endpoint)
 exports.validateQRToken = async (req, res) => {
   try {
+    const organization = await resolveAttendanceOrganization(req);
     const { token } = req.params;
 
-    const qrToken = await AttendanceToken.findOne({ token });
+    const qrToken = await AttendanceToken.findOne({
+      organizationId: organization._id,
+      token
+    });
 
     if (!qrToken) {
       return res.status(404).json({
@@ -137,7 +413,6 @@ exports.validateQRToken = async (req, res) => {
       });
     }
 
-    // Check if valid
     if (!qrToken.isValid()) {
       return res.status(400).json({
         success: false,
@@ -157,20 +432,16 @@ exports.validateQRToken = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error validating QR token:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
 // Record attendance (check-in or check-out)
 exports.recordAttendance = async (req, res) => {
   try {
-    const { token, type } = req.body; // type: 'checkin' or 'checkout'
+    const organization = await resolveAttendanceOrganization(req);
+    const { token, type } = req.body;
 
-    // Validate required fields
     if (!token || !type) {
       return res.status(400).json({
         success: false,
@@ -185,8 +456,10 @@ exports.recordAttendance = async (req, res) => {
       });
     }
 
-    // Find and validate QR token
-    const qrToken = await AttendanceToken.findOne({ token });
+    const qrToken = await AttendanceToken.findOne({
+      organizationId: organization._id,
+      token
+    });
 
     if (!qrToken) {
       return res.status(404).json({
@@ -195,7 +468,6 @@ exports.recordAttendance = async (req, res) => {
       });
     }
 
-    // Check if valid
     if (!qrToken.isValid()) {
       return res.status(400).json({
         success: false,
@@ -203,39 +475,32 @@ exports.recordAttendance = async (req, res) => {
       });
     }
 
-    // Check today's attendance status (using Saudi Arabia timezone)
     const todayStart = dateUtils.getStartOfToday();
     const todayEnd = dateUtils.getEndOfToday();
 
-    // Check if user already has attendance records for today
-    const todayAttendance = await AttendanceLog.find({
+    const todayAttendance = await AttendanceLog.find(buildTenantQuery(organization, {
       userId: req.user.id,
       timestamp: {
         $gte: todayStart,
         $lte: todayEnd
       }
-    }).sort({ timestamp: 1 });
+    })).sort({ timestamp: 1 });
 
-    // Check for existing check-in today
-    const hasCheckInToday = todayAttendance.some(log => log.type === 'checkin');
-    // Check for existing check-out today
-    const hasCheckOutToday = todayAttendance.some(log => log.type === 'checkout');
+    const hasCheckInToday = todayAttendance.some((log) => log.type === 'checkin');
+    const hasCheckOutToday = todayAttendance.some((log) => log.type === 'checkout');
 
-    // Validation rules
-    if (type === 'checkin') {
-      if (hasCheckInToday) {
-        return res.status(400).json({
-          success: false,
-          message: 'You have already checked in today'
-        });
-      }
-    } else if (type === 'checkout') {
-      // For check-out, check if there's an unclosed check-in (not just today, but any recent check-in without checkout)
-      // Get the most recent check-in that doesn't have a corresponding check-out
-      const recentCheckIns = await AttendanceLog.find({
+    if (type === 'checkin' && hasCheckInToday) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already checked in today'
+      });
+    }
+
+    if (type === 'checkout') {
+      const recentCheckIns = await AttendanceLog.find(buildTenantQuery(organization, {
         userId: req.user.id,
         type: 'checkin'
-      })
+      }))
         .sort({ timestamp: -1 })
         .limit(1);
 
@@ -248,26 +513,20 @@ exports.recordAttendance = async (req, res) => {
 
       const lastCheckIn = recentCheckIns[0];
 
-      // Check if there's already a check-out after this check-in
-      const hasCheckOutAfterCheckIn = await AttendanceLog.findOne({
+      const hasCheckOutAfterCheckIn = await AttendanceLog.findOne(buildTenantQuery(organization, {
         userId: req.user.id,
         type: 'checkout',
         timestamp: { $gt: lastCheckIn.timestamp }
-      });
+      }));
 
-      if (hasCheckOutAfterCheckIn) {
-        // There's already a check-out after the last check-in, so check if there's a check-in today
-        if (!hasCheckInToday) {
-          return res.status(400).json({
-            success: false,
-            message: 'You must check in before checking out'
-          });
-        }
+      if (hasCheckOutAfterCheckIn && !hasCheckInToday) {
+        return res.status(400).json({
+          success: false,
+          message: 'You must check in before checking out'
+        });
       }
 
-      // Check if already checked out today (only if checking out on the same day as check-in)
       if (hasCheckOutToday) {
-        // But allow check-out if the last check-in was on a different day
         const lastCheckInDate = dateUtils.getDateString(lastCheckIn.timestamp);
         const todayDate = dateUtils.getDateString(new Date());
 
@@ -280,12 +539,10 @@ exports.recordAttendance = async (req, res) => {
       }
     }
 
-    // Get request metadata
     const ip = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
 
-    // Create attendance log
-    const attendanceLog = await AttendanceLog.create({
+    const attendanceLog = await AttendanceLog.create(attachOrganizationId({
       userId: req.user.id,
       type,
       timestamp: new Date(),
@@ -296,26 +553,26 @@ exports.recordAttendance = async (req, res) => {
         userAgent,
         qrSequence: qrToken.sequenceNumber
       }
-    });
+    }, organization));
 
-    // Mark QR as used (increment usage count)
     await qrToken.markAsUsed();
+    await populateAttendanceLog(attendanceLog);
 
-    // Populate user info
-    await attendanceLog.populate('userId', 'name email department');
-
-    // Check for late arrival on check-in
     if (type === 'checkin') {
-      const user = await User.findById(req.user.id).select('workDays workSchedule');
-      if (user && user.workDays && user.workDays.length > 0) {
-        // Get day name in Saudi timezone
+      const user = await User.findOne(buildTenantQuery(organization, {
+        _id: req.user.id
+      })).select('workDays workSchedule');
+
+      if (user && Array.isArray(user.workDays) && user.workDays.length > 0) {
         const dayName = dateUtils.getDayName(new Date());
 
         if (user.workDays.includes(dayName) && user.workSchedule && user.workSchedule[dayName]) {
           const expectedStartTime = user.workSchedule[dayName].startTime;
+
           if (expectedStartTime) {
-            const [expectedHours, expectedMinutes] = expectedStartTime.split(':').map(Number);
-            // Create expected time in Saudi timezone
+            const [expectedHours, expectedMinutes] = expectedStartTime
+              .split(':')
+              .map(Number);
             const todayComponents = dateUtils.getDateComponents(new Date());
             const expectedTime = dateUtils.createDate(
               todayComponents.year,
@@ -331,19 +588,20 @@ exports.recordAttendance = async (req, res) => {
               const lateMinutes = Math.floor((checkinTime - expectedTime) / (1000 * 60));
 
               await createNotification({
+                organizationId: organization._id,
                 type: 'user_late',
                 title: {
                   en: 'Employee Late Arrival',
-                  ar: 'تأخر موظف'
+                  ar: 'طھط£ط®ط± ظ…ظˆط¸ظپ'
                 },
                 message: {
                   en: `${req.user.name} arrived ${lateMinutes} minute(s) late`,
-                  ar: `${req.user.name} وصل متأخراً ${lateMinutes} دقيقة`
+                  ar: `${req.user.name} ظˆطµظ„ ظ…طھط£ط®ط±ط§ظ‹ ${lateMinutes} ط¯ظ‚ظٹظ‚ط©`
                 },
                 data: {
                   userId: req.user.id,
                   attendanceLogId: attendanceLog._id,
-                  lateMinutes: lateMinutes,
+                  lateMinutes,
                   expectedTime: expectedStartTime,
                   actualTime: checkinTime.toISOString()
                 }
@@ -356,26 +614,23 @@ exports.recordAttendance = async (req, res) => {
 
     res.json({
       success: true,
-      message: type === 'checkin' ? 'Checked in successfully' : 'Checked out successfully',
+      message: type === 'checkin'
+        ? 'Checked in successfully'
+        : 'Checked out successfully',
       data: attendanceLog
     });
   } catch (error) {
-    console.error('Error recording attendance:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
 // Get my attendance logs
 exports.getMyAttendance = async (req, res) => {
   try {
+    const organization = await resolveAttendanceOrganization(req);
     const { startDate, endDate, limit = 30 } = req.query;
+    const query = buildTenantQuery(organization, { userId: req.user.id });
 
-    const query = { userId: req.user.id };
-
-    // Default to last 30 days if no date range specified
     if (!startDate && !endDate) {
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
@@ -388,76 +643,9 @@ exports.getMyAttendance = async (req, res) => {
 
     const logs = await AttendanceLog.find(query)
       .sort({ timestamp: -1 })
-      .populate('tokenId', 'sequenceNumber')
-      .populate('userId', 'name email department');
+      .populate(ATTENDANCE_POPULATE);
 
-    // Group logs by date (use Saudi Arabia timezone)
-    // First, collect all check-ins and check-outs
-    const checkIns = logs.filter(log => log.type === 'checkin').sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    const checkOuts = logs.filter(log => log.type === 'checkout').sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-    const groupedByDate = {};
-
-    // Process check-ins
-    checkIns.forEach(checkIn => {
-      const date = dateUtils.getDateString(checkIn.timestamp);
-      if (!groupedByDate[date]) {
-        groupedByDate[date] = {
-          date,
-          checkin: null,
-          checkout: null
-        };
-      }
-      // Keep the earliest check-in of the day
-      if (!groupedByDate[date].checkin || new Date(checkIn.timestamp) < new Date(groupedByDate[date].checkin.timestamp)) {
-        groupedByDate[date].checkin = checkIn;
-      }
-    });
-
-    // Process check-outs - match them with their corresponding check-ins
-    checkOuts.forEach(checkOut => {
-      // Find the most recent check-in before this check-out
-      const correspondingCheckIn = checkIns
-        .filter(checkIn => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
-        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
-
-      if (correspondingCheckIn) {
-        // Get the date of the check-in (not the check-out)
-        const checkInDate = dateUtils.getDateString(correspondingCheckIn.timestamp);
-
-        // Ensure the group exists
-        if (!groupedByDate[checkInDate]) {
-          groupedByDate[checkInDate] = {
-            date: checkInDate,
-            checkin: null,
-            checkout: null
-          };
-        }
-
-        // Only set checkout if there isn't one already, or if this one is later
-        if (!groupedByDate[checkInDate].checkout || new Date(checkOut.timestamp) > new Date(groupedByDate[checkInDate].checkout.timestamp)) {
-          groupedByDate[checkInDate].checkout = checkOut;
-        }
-      } else {
-        // No corresponding check-in found, group by check-out date
-        const date = dateUtils.getDateString(checkOut.timestamp);
-        if (!groupedByDate[date]) {
-          groupedByDate[date] = {
-            date,
-            checkin: null,
-            checkout: null
-          };
-        }
-        if (!groupedByDate[date].checkout || new Date(checkOut.timestamp) > new Date(groupedByDate[date].checkout.timestamp)) {
-          groupedByDate[date].checkout = checkOut;
-        }
-      }
-    });
-
-    // Convert to array and sort by date descending
-    const formattedLogs = Object.values(groupedByDate)
-      .sort((a, b) => new Date(b.date) - new Date(a.date))
-      .slice(0, parseInt(limit));
+    const formattedLogs = groupAttendanceByDate(logs, parseInt(limit, 10) || 30);
 
     res.json({
       success: true,
@@ -465,47 +653,53 @@ exports.getMyAttendance = async (req, res) => {
       data: formattedLogs
     });
   } catch (error) {
-    console.error('Error fetching attendance logs:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Get attendance stats (admin/supervisor)
+// Get attendance stats
 exports.getAttendanceStats = async (req, res) => {
   try {
-    // Use Saudi Arabia timezone for today's stats
-    const today = dateUtils.getStartOfToday();
-    const tomorrow = dateUtils.getEndOfToday();
-
-    // Get today's stats (in Saudi Arabia timezone)
-    const todayLogs = await AttendanceLog.countDocuments({
-      timestamp: { $gte: today, $lte: tomorrow }
+    const organization = await resolveAttendanceOrganization(req);
+    const { department } = req.query;
+    const todayStart = dateUtils.getStartOfToday();
+    const todayEnd = dateUtils.getEndOfToday();
+    const scope = await resolveAttendanceUserScope(req, organization, {
+      requestedDepartment: department || null
     });
 
-    const todayCheckins = await AttendanceLog.countDocuments({
-      type: 'checkin',
-      timestamp: { $gte: today, $lte: tomorrow }
-    });
+    const todayQuery = applyAttendanceUserScope(buildTenantQuery(organization, {
+      timestamp: { $gte: todayStart, $lte: todayEnd }
+    }), scope);
+    const todayCheckinQuery = {
+      ...todayQuery,
+      type: 'checkin'
+    };
+    const todayCheckoutQuery = {
+      ...todayQuery,
+      type: 'checkout'
+    };
 
-    const todayCheckouts = await AttendanceLog.countDocuments({
-      type: 'checkout',
-      timestamp: { $gte: today, $lte: tomorrow }
-    });
-
-    // Get unique users today
-    const uniqueUsers = await AttendanceLog.distinct('userId', {
-      timestamp: { $gte: today, $lte: tomorrow }
-    });
-
-    // Get active QR stats
-    const activeQRCount = await AttendanceToken.countDocuments({
-      status: 'active'
-    });
-
-    const totalQRs = await AttendanceToken.countDocuments();
+    const [
+      todayLogs,
+      todayCheckins,
+      todayCheckouts,
+      uniqueUsers,
+      activeQRCount,
+      totalQRs
+    ] = await Promise.all([
+      AttendanceLog.countDocuments(todayQuery),
+      AttendanceLog.countDocuments(todayCheckinQuery),
+      AttendanceLog.countDocuments(todayCheckoutQuery),
+      AttendanceLog.distinct('userId', todayQuery),
+      AttendanceToken.countDocuments({
+        organizationId: organization._id,
+        status: 'active'
+      }),
+      AttendanceToken.countDocuments({
+        organizationId: organization._id
+      })
+    ]);
 
     res.json({
       success: true,
@@ -523,20 +717,29 @@ exports.getAttendanceStats = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error fetching attendance stats:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Get all attendance logs (admin/supervisor/employee - employees can only see their own)
+// Get attendance logs
 exports.getAllAttendance = async (req, res) => {
   try {
-    const { startDate, endDate, userId, type, limit = 100, page = 1 } = req.query;
-
-    const query = {};
+    const organization = await resolveAttendanceOrganization(req);
+    const {
+      startDate,
+      endDate,
+      userId,
+      department,
+      type,
+      limit = 100,
+      page = 1
+    } = req.query;
+    const pagination = parsePagination(page, limit);
+    const scope = await resolveAttendanceUserScope(req, organization, {
+      requestedUserId: userId || null,
+      requestedDepartment: department || null
+    });
+    const query = applyAttendanceUserScope(buildTenantQuery(organization, {}), scope);
 
     if (startDate || endDate) {
       query.timestamp = {};
@@ -544,70 +747,51 @@ exports.getAllAttendance = async (req, res) => {
       if (endDate) query.timestamp.$lte = new Date(endDate);
     }
 
-    // Employees can only access their own attendance
-    if (req.user.role === 'employee') {
-      query.userId = req.user.id;
-    } else if (userId) {
-      query.userId = userId;
+    if (type) {
+      query.type = type;
     }
 
-    if (type) query.type = type;
-
-    // Check department access for supervisors
-    if (req.user.role === 'supervisor') {
-      const User = require('../models/User');
-      const departmentUsers = await User.find({
-        department: { $in: req.user.departments || [] }
-      }).select('_id');
-
-      query.userId = {
-        $in: departmentUsers.map(u => u._id)
-      };
-    }
-
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const logs = await AttendanceLog.find(query)
-      .sort({ timestamp: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .populate('userId', 'name email department')
-      .populate('tokenId', 'sequenceNumber');
-
-    const total = await AttendanceLog.countDocuments(query);
+    const [logs, total] = await Promise.all([
+      AttendanceLog.find(query)
+        .sort({ timestamp: -1 })
+        .limit(pagination.limit)
+        .skip(pagination.skip)
+        .populate(ATTENDANCE_POPULATE),
+      AttendanceLog.countDocuments(query)
+    ]);
 
     res.json({
       success: true,
       data: logs,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / parseInt(limit))
+        page: pagination.page,
+        limit: pagination.limit,
+        pages: Math.ceil(total / pagination.limit)
       }
     });
   } catch (error) {
-    console.error('Error fetching all attendance:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Get all attendance grouped by date (for admin dashboard)
+// Get all attendance grouped by date
 exports.getAllAttendanceGrouped = async (req, res) => {
   try {
-    const { startDate, endDate, userId, limit = 30 } = req.query;
+    const organization = await resolveAttendanceOrganization(req);
+    const {
+      startDate,
+      endDate,
+      userId,
+      department,
+      limit = 30
+    } = req.query;
+    const scope = await resolveAttendanceUserScope(req, organization, {
+      requestedUserId: userId || null,
+      requestedDepartment: department || null
+    });
+    const query = applyAttendanceUserScope(buildTenantQuery(organization, {}), scope);
 
-    const query = {};
-
-    // Filter by userId if provided
-    if (userId) {
-      query.userId = userId;
-    }
-
-    // Default to last 30 days if no date range provided
     if (startDate || endDate) {
       query.timestamp = {};
       if (startDate) query.timestamp.$gte = new Date(startDate);
@@ -618,62 +802,18 @@ exports.getAllAttendanceGrouped = async (req, res) => {
       query.timestamp = { $gte: thirtyDaysAgo };
     }
 
-    // Employees can only access their own attendance
-    if (req.user.role === 'employee') {
-      // If userId is provided and it's not the employee's own ID, deny access
-      if (userId && userId !== req.user.id && userId !== req.user._id.toString()) {
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied'
-        });
-      }
-      // Force userId to be the employee's own ID
-      query.userId = req.user.id;
-    } else if (req.user.role === 'supervisor') {
-      // Check department access for supervisors
-      const User = require('../models/User');
-      const departmentUsers = await User.find({
-        department: { $in: req.user.departments || [] }
-      }).select('_id');
-
-      // If userId is provided, check if user is in supervisor's departments
-      if (userId) {
-        const userInDepartment = departmentUsers.some(u => u._id.toString() === userId);
-        if (!userInDepartment) {
-          return res.status(403).json({
-            success: false,
-            message: 'Access denied'
-          });
-        }
-      } else {
-        query.userId = {
-          $in: departmentUsers.map(u => u._id)
-        };
-      }
-    }
-
     const logs = await AttendanceLog.find(query)
       .sort({ timestamp: -1 })
-      .populate('tokenId', 'sequenceNumber')
-      .populate({
-        path: 'userId',
-        select: 'name email department',
-        match: { _id: { $exists: true } } // Only populate if user exists
-      });
+      .populate(ATTENDANCE_POPULATE);
 
-    // Filter out logs where userId population failed (user might be deleted)
-    const validLogs = logs.filter(log => log.userId && log.userId._id);
-
-    // Group by date AND userId (use Saudi Arabia timezone)
-    // First, separate check-ins and check-outs by user
+    const validLogs = logs.filter((log) => log.userId && log.userId._id);
     const userLogs = {};
-    validLogs.forEach(log => {
-      const userId = log.userId._id
-        ? log.userId._id.toString()
-        : (log.userId.toString ? log.userId.toString() : String(log.userId));
 
-      if (!userLogs[userId]) {
-        userLogs[userId] = {
+    validLogs.forEach((log) => {
+      const currentUserId = String(log.userId._id || log.userId);
+
+      if (!userLogs[currentUserId]) {
+        userLogs[currentUserId] = {
           userId: log.userId,
           checkIns: [],
           checkOuts: []
@@ -681,104 +821,102 @@ exports.getAllAttendanceGrouped = async (req, res) => {
       }
 
       if (log.type === 'checkin') {
-        userLogs[userId].checkIns.push(log);
+        userLogs[currentUserId].checkIns.push(log);
       } else if (log.type === 'checkout') {
-        userLogs[userId].checkOuts.push(log);
+        userLogs[currentUserId].checkOuts.push(log);
       }
     });
 
-    // Sort check-ins and check-outs by timestamp for each user
-    Object.keys(userLogs).forEach(userId => {
-      userLogs[userId].checkIns.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-      userLogs[userId].checkOuts.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    Object.values(userLogs).forEach((entry) => {
+      entry.checkIns.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      entry.checkOuts.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     });
 
     const groupedByDateAndUser = {};
 
-    // Process check-ins
-    Object.values(userLogs).forEach(({ userId, checkIns }) => {
-      checkIns.forEach(checkIn => {
+    Object.values(userLogs).forEach(({ userId: groupedUser, checkIns }) => {
+      checkIns.forEach((checkIn) => {
         const date = dateUtils.getDateString(checkIn.timestamp);
-        const userIdStr = userId._id ? userId._id.toString() : userId.toString();
-        const key = `${date}_${userIdStr}`;
+        const key = `${date}_${groupedUser._id}`;
 
         if (!groupedByDateAndUser[key]) {
           groupedByDateAndUser[key] = {
             date,
-            userId: userId,
+            userId: groupedUser,
             checkin: null,
             checkout: null
           };
         }
 
-        // Keep earliest check-in for this user on this date
-        if (!groupedByDateAndUser[key].checkin || new Date(checkIn.timestamp) < new Date(groupedByDateAndUser[key].checkin.timestamp)) {
+        if (
+          !groupedByDateAndUser[key].checkin ||
+          new Date(checkIn.timestamp) < new Date(groupedByDateAndUser[key].checkin.timestamp)
+        ) {
           groupedByDateAndUser[key].checkin = checkIn;
         }
       });
     });
 
-    // Process check-outs - match them with their corresponding check-ins
-    Object.values(userLogs).forEach(({ userId, checkIns, checkOuts }) => {
-      checkOuts.forEach(checkOut => {
-        const userIdStr = userId._id ? userId._id.toString() : userId.toString();
-
-        // Find the most recent check-in before this check-out for this user
+    Object.values(userLogs).forEach(({ userId: groupedUser, checkIns, checkOuts }) => {
+      checkOuts.forEach((checkOut) => {
         const correspondingCheckIn = checkIns
-          .filter(checkIn => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
+          .filter((checkIn) => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
           .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
 
         if (correspondingCheckIn) {
-          // Get the date of the check-in (not the check-out)
           const checkInDate = dateUtils.getDateString(correspondingCheckIn.timestamp);
-          const key = `${checkInDate}_${userIdStr}`;
+          const key = `${checkInDate}_${groupedUser._id}`;
 
-          // Ensure the group exists
           if (!groupedByDateAndUser[key]) {
             groupedByDateAndUser[key] = {
               date: checkInDate,
-              userId: userId,
+              userId: groupedUser,
               checkin: null,
               checkout: null
             };
           }
 
-          // Only set checkout if there isn't one already, or if this one is later
-          if (!groupedByDateAndUser[key].checkout || new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)) {
+          if (
+            !groupedByDateAndUser[key].checkout ||
+            new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)
+          ) {
             groupedByDateAndUser[key].checkout = checkOut;
           }
-        } else {
-          // No corresponding check-in found, group by check-out date
-          const date = dateUtils.getDateString(checkOut.timestamp);
-          const key = `${date}_${userIdStr}`;
 
-          if (!groupedByDateAndUser[key]) {
-            groupedByDateAndUser[key] = {
-              date,
-              userId: userId,
-              checkin: null,
-              checkout: null
-            };
-          }
+          return;
+        }
 
-          if (!groupedByDateAndUser[key].checkout || new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)) {
-            groupedByDateAndUser[key].checkout = checkOut;
-          }
+        const date = dateUtils.getDateString(checkOut.timestamp);
+        const key = `${date}_${groupedUser._id}`;
+
+        if (!groupedByDateAndUser[key]) {
+          groupedByDateAndUser[key] = {
+            date,
+            userId: groupedUser,
+            checkin: null,
+            checkout: null
+          };
+        }
+
+        if (
+          !groupedByDateAndUser[key].checkout ||
+          new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)
+        ) {
+          groupedByDateAndUser[key].checkout = checkOut;
         }
       });
     });
 
-    // Convert to array and sort by date (newest first), then by userId
     const formattedLogs = Object.values(groupedByDateAndUser)
       .sort((a, b) => {
         const dateCompare = new Date(b.date) - new Date(a.date);
-        if (dateCompare !== 0) return dateCompare;
-        // If same date, sort by user name
-        const nameA = a.userId?.name || '';
-        const nameB = b.userId?.name || '';
-        return nameA.localeCompare(nameB);
+        if (dateCompare !== 0) {
+          return dateCompare;
+        }
+
+        return (a.userId?.name || '').localeCompare(b.userId?.name || '');
       })
-      .slice(0, parseInt(limit));
+      .slice(0, parseInt(limit, 10) || 30);
 
     res.json({
       success: true,
@@ -786,53 +924,52 @@ exports.getAllAttendanceGrouped = async (req, res) => {
       data: formattedLogs
     });
   } catch (error) {
-    console.error('Error fetching grouped attendance:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Check for absent users (can be called manually or by cron)
+// Check for absent users
 exports.checkAbsentUsers = async (req, res) => {
   try {
-    await checkAbsentUsers();
+    const organization = await resolveAttendanceOrganization(req);
+    const result = await checkAbsentUsers({
+      organizationId: organization._id
+    });
+
     res.json({
       success: true,
-      message: 'Absent users check completed'
+      message: 'Absent users check completed',
+      data: result
     });
   } catch (error) {
-    console.error('Error checking absent users:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Cleanup expired QR codes (can be called manually or by cron)
+// Cleanup expired QR codes
 exports.cleanupExpiredQRs = async (req, res) => {
   try {
-    // Mark expired tokens
+    const organization = await resolveAttendanceOrganization(req);
+
     await AttendanceToken.updateMany(
       {
+        organizationId: organization._id,
         status: 'active',
         validTo: { $lt: new Date() }
       },
       { status: 'expired' }
     );
 
-    // Keep only last 10 QR codes
-    const tokensToKeep = await AttendanceToken.find()
+    const tokensToKeep = await AttendanceToken.find({
+      organizationId: organization._id
+    })
       .sort({ createdAt: -1 })
       .limit(10)
       .select('_id');
 
-    const idsToKeep = tokensToKeep.map(t => t._id);
-
     const deleteResult = await AttendanceToken.deleteMany({
-      _id: { $nin: idsToKeep }
+      organizationId: organization._id,
+      _id: { $nin: tokensToKeep.map((tokenEntry) => tokenEntry._id) }
     });
 
     res.json({
@@ -844,15 +981,11 @@ exports.cleanupExpiredQRs = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error cleaning up QR codes:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
-// Update attendance log timestamp (Admin only)
+// Update attendance log timestamp
 exports.updateAttendanceLog = async (req, res) => {
   try {
     const { id } = req.params;
@@ -867,22 +1000,32 @@ exports.updateAttendanceLog = async (req, res) => {
       });
     }
 
-    // Update timestamp if provided
+    const organization = await resolveAttendanceOrganization(req, log.organizationId);
+
     if (timestamp) {
       log.timestamp = new Date(timestamp);
     }
 
-    // Update notes if provided
     if (notes !== undefined) {
       log.notes = notes;
     }
 
-    // Mark as manually edited
     log.method = 'manual';
-
     await log.save();
-    await log.populate('userId', 'name email department');
-    await log.populate('tokenId', 'sequenceNumber');
+    await populateAttendanceLog(log);
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'attendance_log.updated',
+      entityType: 'attendance_log',
+      entityId: log._id,
+      metadata: {
+        timestamp: log.timestamp,
+        notes: log.notes || ''
+      }
+    });
 
     res.json({
       success: true,
@@ -890,10 +1033,6 @@ exports.updateAttendanceLog = async (req, res) => {
       data: log
     });
   } catch (error) {
-    console.error('Error updating attendance log:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };

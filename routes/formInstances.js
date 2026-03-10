@@ -18,22 +18,22 @@ const upload = require('../middleware/upload');
 router.use(protect);
 
 router.route('/')
-  .get(authorize('admin', 'supervisor'), getFormInstances)
-  .post(authorize('admin', 'supervisor'), createFormInstance);
+  .get(authorize('platform_admin', 'admin', 'supervisor', 'employee'), getFormInstances)
+  .post(authorize('platform_admin', 'admin', 'supervisor', 'employee'), createFormInstance);
 
-router.get('/stats/summary', authorize('admin', 'supervisor'), getFormStats);
+router.get('/stats/summary', authorize('platform_admin', 'admin', 'supervisor'), getFormStats);
 
 router.route('/:id')
-  .get(authorize('admin', 'supervisor'), getFormInstance)
-  .put(authorize('admin', 'supervisor'), updateFormInstance)
-  .delete(authorize('admin', 'supervisor'), deleteFormInstance);
+  .get(authorize('platform_admin', 'admin', 'supervisor', 'employee'), getFormInstance)
+  .put(authorize('platform_admin', 'admin', 'supervisor', 'employee'), updateFormInstance)
+  .delete(authorize('platform_admin', 'admin', 'supervisor', 'employee'), deleteFormInstance);
 
-router.put('/:id/approve', authorize('admin', 'supervisor'), approveFormInstance);
-router.get('/:id/export', authorize('admin', 'supervisor'), exportFormInstance);
+router.put('/:id/approve', authorize('platform_admin', 'admin', 'supervisor'), approveFormInstance);
+router.get('/:id/export', authorize('platform_admin', 'admin', 'supervisor', 'employee'), exportFormInstance);
 
 // Image upload routes
-router.post('/:id/images', authorize('admin', 'supervisor'), upload.array('images', 10), uploadFormImages);
-router.delete('/:id/images/:imageId', authorize('admin', 'supervisor'), deleteFormImage);
+router.post('/:id/images', authorize('platform_admin', 'admin', 'supervisor'), upload.array('images', 10), uploadFormImages);
+router.delete('/:id/images/:imageId', authorize('platform_admin', 'admin', 'supervisor'), deleteFormImage);
 
 module.exports = router;
 

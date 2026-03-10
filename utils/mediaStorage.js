@@ -138,9 +138,15 @@ const deleteStoredAsset = async (storedPath) => {
 
 const uploadUserImage = (file) => uploadBufferToCloudinary(file, `${uploadRootFolder}/users`);
 
-const uploadFormImage = (file, formInstanceId) => (
-  uploadBufferToCloudinary(file, `${uploadRootFolder}/form-instances/${formInstanceId}`)
-);
+const uploadFormImage = (file, organizationId, formInstanceId) => {
+  const resolvedOrganizationId = formInstanceId ? organizationId : null;
+  const resolvedFormInstanceId = formInstanceId || organizationId;
+  const folder = resolvedOrganizationId
+    ? `${uploadRootFolder}/organizations/${resolvedOrganizationId}/form-instances/${resolvedFormInstanceId}`
+    : `${uploadRootFolder}/form-instances/${resolvedFormInstanceId}`;
+
+  return uploadBufferToCloudinary(file, folder);
+};
 
 module.exports = {
   deleteStoredAsset,

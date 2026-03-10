@@ -16,7 +16,7 @@ const { protect, authorize } = require('../middleware/auth');
 router.use(protect);
 
 router.get('/my-balance', getMyLeaveBalance);
-router.get('/stats/summary', authorize('admin', 'supervisor'), getLeaveStats);
+router.get('/stats/summary', authorize('platform_admin', 'admin', 'supervisor'), getLeaveStats);
 
 router.route('/')
   .get(getLeaveRequests)
@@ -27,7 +27,7 @@ router.route('/:id')
   .put(updateLeaveRequest)
   .delete(deleteLeaveRequest);
 
-router.put('/:id/approve', authorize('admin', 'supervisor'), approveLeaveRequest);
+router.put('/:id/approve', authorize('platform_admin', 'admin', 'supervisor'), approveLeaveRequest);
 router.put('/:id/cancel', cancelLeaveRequest);
 
 module.exports = router;

@@ -1,23 +1,37 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 const FormInstance = require('../models/FormInstance');
 const LeaveRequest = require('../models/LeaveRequest');
 const AttendanceLog = require('../models/AttendanceLog');
 const User = require('../models/User');
-
 const cache = require('../utils/cache');
 const logger = require('../utils/logger');
+const dateUtils = require('../utils/dateUtils');
+const { buildTenantQuery } = require('../utils/tenantScope');
+const {
+  getManagedDepartments,
+  resolveScopedOrganization
+} = require('../utils/formAccess');
+const { normalizeRole } = require('../utils/tenantConstants');
+const { getOrganizationDepartmentUserIds } = require('../utils/scopedUsers');
+
+const EMPLOYEE_LIKE_ROLES = new Set(['employee', 'qr_manager']);
 
 // @desc    Get dashboard summary
 // @route   GET /api/dashboard/summary
 // @access  Private
 router.get('/summary', protect, async (req, res) => {
   try {
-    // Generate cache key based on user role and ID
-    const cacheKey = cache.key('dashboard', req.user.role, req.user.id);
-    
-    // Try to get from cache first
+    const organization = await resolveScopedOrganization(req);
+    const normalizedRole = normalizeRole(req.user.role);
+    const cacheKey = cache.key(
+      'dashboard',
+      organization._id,
+      normalizedRole,
+      req.user.id
+    );
+
     const cached = await cache.get(cacheKey);
     if (cached) {
       return res.json({
@@ -27,15 +41,14 @@ router.get('/summary', protect, async (req, res) => {
       });
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const todayStart = dateUtils.getStartOfToday();
+    const todayEnd = dateUtils.getEndOfToday();
+    const thisWeekStart = new Date(todayStart);
+    thisWeekStart.setDate(thisWeekStart.getDate() - thisWeekStart.getDay());
+    const monthStart = new Date(todayStart);
+    monthStart.setDate(1);
 
-    const thisWeekStart = new Date(today);
-    thisWeekStart.setDate(today.getDate() - today.getDay());
-
-    // Employee-specific data
-    if (req.user.role === 'employee') {
-      // Use Promise.all for parallel queries
+    if (EMPLOYEE_LIKE_ROLES.has(normalizedRole)) {
       const [
         user,
         todayCheckin,
@@ -46,46 +59,50 @@ router.get('/summary', protect, async (req, res) => {
         thisMonthAttendance,
         upcomingLeaves
       ] = await Promise.all([
-        User.findById(req.user.id).select('leaveBalance').lean(),
-        AttendanceLog.findOne({
+        User.findOne(buildTenantQuery(organization, {
+          _id: req.user.id
+        }))
+          .select('leaveBalance')
+          .lean(),
+        AttendanceLog.findOne(buildTenantQuery(organization, {
           userId: req.user.id,
           type: 'checkin',
-          timestamp: { $gte: today }
-        }).lean(),
-        AttendanceLog.findOne({
+          timestamp: { $gte: todayStart, $lte: todayEnd }
+        })).lean(),
+        AttendanceLog.findOne(buildTenantQuery(organization, {
           userId: req.user.id,
           type: 'checkout',
-          timestamp: { $gte: today }
-        }).lean(),
-        LeaveRequest.countDocuments({
+          timestamp: { $gte: todayStart, $lte: todayEnd }
+        })).lean(),
+        LeaveRequest.countDocuments(buildTenantQuery(organization, {
           userId: req.user.id,
           status: 'pending'
-        }),
-        LeaveRequest.countDocuments({
+        })),
+        LeaveRequest.countDocuments(buildTenantQuery(organization, {
           userId: req.user.id,
           status: 'approved'
-        }),
-        LeaveRequest.countDocuments({
+        })),
+        LeaveRequest.countDocuments(buildTenantQuery(organization, {
           userId: req.user.id,
           status: 'rejected'
-        }),
-        AttendanceLog.distinct('timestamp', {
+        })),
+        AttendanceLog.distinct('timestamp', buildTenantQuery(organization, {
           userId: req.user.id,
           type: 'checkin',
-          timestamp: { $gte: new Date(today.getFullYear(), today.getMonth(), 1) }
-        }),
-        LeaveRequest.countDocuments({
+          timestamp: { $gte: monthStart }
+        })),
+        LeaveRequest.countDocuments(buildTenantQuery(organization, {
           userId: req.user.id,
           status: 'approved',
-          startDate: { $gte: today }
-        })
+          startDate: { $gte: todayStart }
+        }))
       ]);
 
       const data = {
         attendance: {
           today: todayCheckin ? 1 : 0,
-          checkedIn: !!todayCheckin,
-          checkedOut: !!todayCheckout,
+          checkedIn: Boolean(todayCheckin),
+          checkedOut: Boolean(todayCheckout),
           thisMonth: thisMonthAttendance.length
         },
         leaves: {
@@ -97,7 +114,6 @@ router.get('/summary', protect, async (req, res) => {
         }
       };
 
-      // Cache for 1 minute
       await cache.set(cacheKey, data, cache.CACHE_TTL.SHORT);
 
       return res.json({
@@ -106,33 +122,46 @@ router.get('/summary', protect, async (req, res) => {
       });
     }
 
-    // Admin/Supervisor data
-    let query = {};
     let departmentUsers = null;
+    let formQuery = buildTenantQuery(organization, {});
+    let leaveQuery = buildTenantQuery(organization, {});
+    let attendanceQuery = buildTenantQuery(organization, {
+      type: 'checkin',
+      timestamp: { $gte: todayStart, $lte: todayEnd }
+    });
+    let userQuery = buildTenantQuery(organization, { isActive: true });
 
-    // Department filter for supervisors
-    if (req.user.role === 'supervisor') {
-      query.department = { $in: req.user.departments };
-      // Get department users once for reuse
-      departmentUsers = await User.find({
-        department: { $in: req.user.departments }
-      }).select('_id').lean();
+    if (normalizedRole === 'supervisor') {
+      const managedDepartments = getManagedDepartments(req.user);
+
+      if (managedDepartments) {
+        const departmentList = Array.from(managedDepartments);
+        departmentUsers = await getOrganizationDepartmentUserIds(
+          organization._id,
+          departmentList
+        );
+
+        formQuery = {
+          ...formQuery,
+          department: { $in: departmentList }
+        };
+        leaveQuery = {
+          ...leaveQuery,
+          userId: { $in: departmentUsers }
+        };
+        attendanceQuery = {
+          ...attendanceQuery,
+          userId: { $in: departmentUsers }
+        };
+        userQuery = {
+          ...userQuery,
+          department: { $in: departmentList }
+        };
+      }
     }
 
-    // Prepare queries for parallel execution
-    const attendanceQuery = req.user.role === 'supervisor' && departmentUsers
-      ? { userId: { $in: departmentUsers.map(u => u._id) }, type: 'checkin', timestamp: { $gte: today } }
-      : { type: 'checkin', timestamp: { $gte: today } };
+    const upcomingWindowEnd = new Date(todayStart.getTime() + (7 * 24 * 60 * 60 * 1000));
 
-    const leaveQuery = req.user.role === 'supervisor' && departmentUsers
-      ? { userId: { $in: departmentUsers.map(u => u._id) } }
-      : {};
-
-    const userQuery = req.user.role === 'supervisor'
-      ? { department: { $in: req.user.departments }, isActive: true }
-      : { isActive: true };
-
-    // Execute all queries in parallel
     const [
       todayForms,
       thisWeekForms,
@@ -143,21 +172,33 @@ router.get('/summary', protect, async (req, res) => {
       totalUsers,
       recentForms
     ] = await Promise.all([
-      FormInstance.countDocuments({ ...query, date: { $gte: today } }),
-      FormInstance.countDocuments({ ...query, date: { $gte: thisWeekStart } }),
-      FormInstance.countDocuments({ ...query, status: 'submitted' }),
+      FormInstance.countDocuments({
+        ...formQuery,
+        date: { $gte: todayStart, $lte: todayEnd }
+      }),
+      FormInstance.countDocuments({
+        ...formQuery,
+        date: { $gte: thisWeekStart }
+      }),
+      FormInstance.countDocuments({
+        ...formQuery,
+        status: 'submitted'
+      }),
       AttendanceLog.countDocuments(attendanceQuery),
-      LeaveRequest.countDocuments({ ...leaveQuery, status: 'pending' }),
+      LeaveRequest.countDocuments({
+        ...leaveQuery,
+        status: 'pending'
+      }),
       LeaveRequest.countDocuments({
         ...leaveQuery,
         status: 'approved',
-        startDate: { $gte: today, $lte: new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000) }
+        startDate: { $gte: todayStart, $lte: upcomingWindowEnd }
       }),
       User.countDocuments(userQuery),
-      FormInstance.find(query)
-        .populate('templateId', 'title')
-        .populate('filledBy', 'name department')
-        .sort('-createdAt')
+      FormInstance.find(formQuery)
+        .populate('templateId', 'organizationId title')
+        .populate('filledBy', 'organizationId name department')
+        .sort({ createdAt: -1 })
         .limit(5)
         .lean()
     ]);
@@ -181,7 +222,6 @@ router.get('/summary', protect, async (req, res) => {
       recentForms
     };
 
-    // Cache for 1 minute
     await cache.set(cacheKey, data, cache.CACHE_TTL.SHORT);
 
     res.json({
@@ -190,7 +230,7 @@ router.get('/summary', protect, async (req, res) => {
     });
   } catch (error) {
     logger.error('Dashboard error:', error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       message: error.message
     });
@@ -198,4 +238,3 @@ router.get('/summary', protect, async (req, res) => {
 });
 
 module.exports = router;
-

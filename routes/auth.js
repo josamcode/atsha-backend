@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getOrganizationContext,
   register,
+  registerOrganization,
   login,
   refreshToken,
   logout,
@@ -21,7 +22,8 @@ router.use(resolveOrganization);
 
 router.get('/organization', requireOrganization, getOrganizationContext);
 router.post('/register', requireOrganization, register);
-router.post('/login', requireOrganization, login);
+router.post('/register-organization', registerOrganization);
+router.post('/login', login);
 router.post('/refresh', refreshToken);
 router.post('/logout', protect, logout);
 router.get('/me', protect, getMe);

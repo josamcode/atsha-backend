@@ -1,47 +1,67 @@
 const Notification = require('../models/Notification');
-const User = require('../models/User');
+const { buildTenantQuery } = require('../utils/tenantScope');
+const { resolveScopedOrganization } = require('../utils/formAccess');
+
+const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
+  success: false,
+  message: error.message
+});
+
+const parsePagination = (page, limit) => {
+  const normalizedPage = Math.max(parseInt(page, 10) || 1, 1);
+  const normalizedLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+
+  return {
+    page: normalizedPage,
+    limit: normalizedLimit,
+    skip: (normalizedPage - 1) * normalizedLimit
+  };
+};
+
+const resolveNotificationOrganization = async (req, fallbackOrganizationId = null) => (
+  resolveScopedOrganization(req, fallbackOrganizationId)
+);
 
 // @desc    Get all notifications for current user
 // @route   GET /api/notifications
 // @access  Private
 exports.getNotifications = async (req, res) => {
   try {
+    const organization = await resolveNotificationOrganization(req);
     const { read, limit = 50, page = 1 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pagination = parsePagination(page, limit);
+    const query = buildTenantQuery(organization, { recipient: req.user.id });
 
-    const query = { recipient: req.user.id };
     if (read !== undefined) {
       query.read = read === 'true';
     }
 
-    const notifications = await Notification.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .populate('recipient', 'name email');
-
-    const total = await Notification.countDocuments(query);
-    const unreadCount = await Notification.countDocuments({
-      recipient: req.user.id,
-      read: false
-    });
+    const [notifications, total, unreadCount] = await Promise.all([
+      Notification.find(query)
+        .sort({ createdAt: -1 })
+        .limit(pagination.limit)
+        .skip(pagination.skip)
+        .populate('recipient', 'organizationId name email'),
+      Notification.countDocuments(query),
+      Notification.countDocuments(buildTenantQuery(organization, {
+        recipient: req.user.id,
+        read: false
+      }))
+    ]);
 
     res.json({
       success: true,
       data: notifications,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / parseInt(limit))
+        page: pagination.page,
+        limit: pagination.limit,
+        pages: Math.ceil(total / pagination.limit)
       },
       unreadCount
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -50,20 +70,18 @@ exports.getNotifications = async (req, res) => {
 // @access  Private
 exports.getUnreadCount = async (req, res) => {
   try {
-    const count = await Notification.countDocuments({
+    const organization = await resolveNotificationOrganization(req);
+    const count = await Notification.countDocuments(buildTenantQuery(organization, {
       recipient: req.user.id,
       read: false
-    });
+    }));
 
     res.json({
       success: true,
       data: { count }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -72,10 +90,11 @@ exports.getUnreadCount = async (req, res) => {
 // @access  Private
 exports.markAsRead = async (req, res) => {
   try {
-    const notification = await Notification.findOne({
+    const organization = await resolveNotificationOrganization(req);
+    const notification = await Notification.findOne(buildTenantQuery(organization, {
       _id: req.params.id,
       recipient: req.user.id
-    });
+    }));
 
     if (!notification) {
       return res.status(404).json({
@@ -93,10 +112,7 @@ exports.markAsRead = async (req, res) => {
       data: notification
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -105,11 +121,12 @@ exports.markAsRead = async (req, res) => {
 // @access  Private
 exports.markAllAsRead = async (req, res) => {
   try {
+    const organization = await resolveNotificationOrganization(req);
     const result = await Notification.updateMany(
-      {
+      buildTenantQuery(organization, {
         recipient: req.user.id,
         read: false
-      },
+      }),
       {
         read: true,
         readAt: new Date()
@@ -123,10 +140,7 @@ exports.markAllAsRead = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -135,10 +149,11 @@ exports.markAllAsRead = async (req, res) => {
 // @access  Private
 exports.deleteNotification = async (req, res) => {
   try {
-    const notification = await Notification.findOneAndDelete({
+    const organization = await resolveNotificationOrganization(req);
+    const notification = await Notification.findOneAndDelete(buildTenantQuery(organization, {
       _id: req.params.id,
       recipient: req.user.id
-    });
+    }));
 
     if (!notification) {
       return res.status(404).json({
@@ -152,10 +167,7 @@ exports.deleteNotification = async (req, res) => {
       data: {}
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -164,9 +176,10 @@ exports.deleteNotification = async (req, res) => {
 // @access  Private
 exports.deleteAllNotifications = async (req, res) => {
   try {
-    const result = await Notification.deleteMany({
+    const organization = await resolveNotificationOrganization(req);
+    const result = await Notification.deleteMany(buildTenantQuery(organization, {
       recipient: req.user.id
-    });
+    }));
 
     res.json({
       success: true,
@@ -175,10 +188,6 @@ exports.deleteAllNotifications = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
-

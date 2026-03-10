@@ -14,14 +14,14 @@ router.use(protect);
 
 router.route('/')
   .get(getFormTemplates)
-  .post(authorize('admin'), createFormTemplate);
+  .post(authorize('platform_admin', 'admin'), createFormTemplate);
 
 router.route('/:id')
   .get(getFormTemplate)
-  .put(authorize('admin'), updateFormTemplate)
-  .delete(authorize('admin'), deleteFormTemplate);
+  .put(authorize('platform_admin', 'admin'), updateFormTemplate)
+  .delete(authorize('platform_admin', 'admin'), deleteFormTemplate);
 
-router.post('/:id/duplicate', authorize('admin'), duplicateFormTemplate);
+router.post('/:id/duplicate', authorize('platform_admin', 'admin'), duplicateFormTemplate);
 
 module.exports = router;
 

@@ -133,6 +133,8 @@ app.use('/api/leaves', require('./routes/leaves'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/messages', require('./routes/messages'));
+app.use('/api/organizations', require('./routes/organizations'));
+app.use('/api/invitations', require('./routes/invitations'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -178,4 +180,3 @@ process.on('SIGTERM', () => {
 });
 
 module.exports = app;
-

@@ -1,48 +1,115 @@
 const Message = require('../models/Message');
 const User = require('../models/User');
+const { attachOrganizationId, buildTenantQuery } = require('../utils/tenantScope');
+const {
+  createHttpError,
+  resolveScopedOrganization
+} = require('../utils/formAccess');
+const { normalizeRole } = require('../utils/tenantConstants');
+
+const MESSAGE_POPULATE = [
+  {
+    path: 'sender',
+    select: 'organizationId name email department role'
+  },
+  {
+    path: 'recipient',
+    select: 'organizationId name email department role'
+  }
+];
+
+const BROADCAST_ALLOWED_ROLES = new Set([
+  'platform_admin',
+  'organization_admin'
+]);
+
+const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
+  success: false,
+  message: error.message
+});
+
+const parsePagination = (page, limit) => {
+  const normalizedPage = Math.max(parseInt(page, 10) || 1, 1);
+  const normalizedLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+
+  return {
+    page: normalizedPage,
+    limit: normalizedLimit,
+    skip: (normalizedPage - 1) * normalizedLimit
+  };
+};
+
+const resolveMessageOrganization = async (req, fallbackOrganizationId = null) => (
+  resolveScopedOrganization(req, fallbackOrganizationId)
+);
+
+const getOrganizationUserOrThrow = async (organizationId, userId) => {
+  const user = await User.findOne({
+    _id: userId,
+    organizationId
+  })
+    .select('_id organizationId name email department role isActive')
+    .lean();
+
+  if (!user) {
+    throw createHttpError(404, 'Recipient not found');
+  }
+
+  return user;
+};
+
+const ensureMessageOwnership = (message, userId) => {
+  const senderId = message.sender?._id || message.sender;
+  const recipientId = message.recipient?._id || message.recipient;
+
+  if (
+    String(senderId) !== String(userId) &&
+    String(recipientId) !== String(userId)
+  ) {
+    throw createHttpError(403, 'You do not have permission to view this message');
+  }
+};
 
 // @desc    Get all messages for current user (inbox)
 // @route   GET /api/messages
 // @access  Private
 exports.getMessages = async (req, res) => {
   try {
+    const organization = await resolveMessageOrganization(req);
     const { read, limit = 50, page = 1 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pagination = parsePagination(page, limit);
+    const query = buildTenantQuery(organization, { recipient: req.user.id });
 
-    const query = { recipient: req.user.id };
     if (read !== undefined) {
       query.read = read === 'true';
     }
 
-    const messages = await Message.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .populate('sender', 'name email department role')
-      .populate('recipient', 'name email department role');
-
-    const total = await Message.countDocuments(query);
-    const unreadCount = await Message.countDocuments({
-      recipient: req.user.id,
-      read: false
-    });
+    const [messages, total, unreadCount] = await Promise.all([
+      Message.find(query)
+        .sort({ createdAt: -1 })
+        .limit(pagination.limit)
+        .skip(pagination.skip)
+        .populate(MESSAGE_POPULATE),
+      Message.countDocuments(query),
+      Message.countDocuments(buildTenantQuery(organization, {
+        recipient: req.user.id,
+        read: false
+      }))
+    ]);
 
     res.json({
       success: true,
       data: messages,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / parseInt(limit))
+        page: pagination.page,
+        limit: pagination.limit,
+        pages: Math.ceil(total / pagination.limit)
       },
       unreadCount
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -51,33 +118,32 @@ exports.getMessages = async (req, res) => {
 // @access  Private
 exports.getSentMessages = async (req, res) => {
   try {
+    const organization = await resolveMessageOrganization(req);
     const { limit = 50, page = 1 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pagination = parsePagination(page, limit);
+    const query = buildTenantQuery(organization, { sender: req.user.id });
 
-    const messages = await Message.find({ sender: req.user.id })
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .populate('sender', 'name email department role')
-      .populate('recipient', 'name email department role');
-
-    const total = await Message.countDocuments({ sender: req.user.id });
+    const [messages, total] = await Promise.all([
+      Message.find(query)
+        .sort({ createdAt: -1 })
+        .limit(pagination.limit)
+        .skip(pagination.skip)
+        .populate(MESSAGE_POPULATE),
+      Message.countDocuments(query)
+    ]);
 
     res.json({
       success: true,
       data: messages,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / parseInt(limit))
+        page: pagination.page,
+        limit: pagination.limit,
+        pages: Math.ceil(total / pagination.limit)
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -86,29 +152,28 @@ exports.getSentMessages = async (req, res) => {
 // @access  Private
 exports.getConversation = async (req, res) => {
   try {
+    const organization = await resolveMessageOrganization(req);
     const { userId } = req.params;
     const { limit = 100 } = req.query;
 
-    const messages = await Message.find({
+    await getOrganizationUserOrThrow(organization._id, userId);
+
+    const messages = await Message.find(buildTenantQuery(organization, {
       $or: [
         { sender: req.user.id, recipient: userId },
         { sender: userId, recipient: req.user.id }
       ]
-    })
+    }))
       .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .populate('sender', 'name email department role')
-      .populate('recipient', 'name email department role');
+      .limit(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500))
+      .populate(MESSAGE_POPULATE);
 
     res.json({
       success: true,
-      data: messages.reverse() // Reverse to show oldest first
+      data: messages.reverse()
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -117,20 +182,18 @@ exports.getConversation = async (req, res) => {
 // @access  Private
 exports.getUnreadCount = async (req, res) => {
   try {
-    const count = await Message.countDocuments({
+    const organization = await resolveMessageOrganization(req);
+    const count = await Message.countDocuments(buildTenantQuery(organization, {
       recipient: req.user.id,
       read: false
-    });
+    }));
 
     res.json({
       success: true,
       data: { count }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -140,8 +203,7 @@ exports.getUnreadCount = async (req, res) => {
 exports.getMessage = async (req, res) => {
   try {
     const message = await Message.findById(req.params.id)
-      .populate('sender', 'name email department role')
-      .populate('recipient', 'name email department role');
+      .populate(MESSAGE_POPULATE);
 
     if (!message) {
       return res.status(404).json({
@@ -150,17 +212,11 @@ exports.getMessage = async (req, res) => {
       });
     }
 
-    // Check if user is sender or recipient
-    if (message.sender._id.toString() !== req.user.id &&
-      message.recipient._id.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        message: 'You do not have permission to view this message'
-      });
-    }
+    await resolveMessageOrganization(req, message.organizationId);
+    ensureMessageOwnership(message, req.user.id);
 
-    // Mark as read if recipient
-    if (message.recipient._id.toString() === req.user.id && !message.read) {
+    const recipientId = message.recipient?._id || message.recipient;
+    if (String(recipientId) === String(req.user.id) && !message.read) {
       message.read = true;
       message.readAt = new Date();
       await message.save();
@@ -171,10 +227,7 @@ exports.getMessage = async (req, res) => {
       data: message
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -183,7 +236,14 @@ exports.getMessage = async (req, res) => {
 // @access  Private
 exports.sendMessage = async (req, res) => {
   try {
-    const { recipient, subject, content, isBroadcast, recipients } = req.body;
+    const organization = await resolveMessageOrganization(req);
+    const {
+      recipient,
+      subject,
+      content,
+      isBroadcast,
+      recipients
+    } = req.body;
 
     if (!subject || !content) {
       return res.status(400).json({
@@ -192,84 +252,86 @@ exports.sendMessage = async (req, res) => {
       });
     }
 
-    // Check if sending to multiple recipients (admin only)
-    if (isBroadcast && recipients && recipients.length > 0) {
-      if (req.user.role !== 'admin') {
-        return res.status(403).json({
-          success: false,
-          message: 'Only admins can send broadcast messages'
-        });
+    const normalizedRole = normalizeRole(req.user.role);
+
+    if (isBroadcast) {
+      if (!BROADCAST_ALLOWED_ROLES.has(normalizedRole)) {
+        throw createHttpError(403, 'Only organization admins can send broadcast messages');
       }
 
-      // Create message for each recipient
-      const messages = recipients.map(recipientId => ({
-        sender: req.user.id,
-        recipient: recipientId,
-        subject,
-        content,
-        isBroadcast: true,
-        broadcastRecipients: recipients
-      }));
+      if (!Array.isArray(recipients) || recipients.length === 0) {
+        throw createHttpError(400, 'Recipients are required for broadcast messages');
+      }
+
+      const uniqueRecipientIds = [...new Set(
+        recipients
+          .map((value) => String(value))
+          .filter(Boolean)
+      )];
+
+      const recipientUsers = await User.find({
+        organizationId: organization._id,
+        _id: { $in: uniqueRecipientIds }
+      })
+        .select('_id organizationId name email department role')
+        .lean();
+
+      if (recipientUsers.length !== uniqueRecipientIds.length) {
+        throw createHttpError(400, 'One or more recipients are invalid for this organization');
+      }
+
+      const messages = recipientUsers.map((recipientUser) => (
+        attachOrganizationId({
+          sender: req.user.id,
+          recipient: recipientUser._id,
+          subject,
+          content,
+          isBroadcast: true,
+          broadcastRecipients: recipientUsers.map((user) => user._id)
+        }, organization)
+      ));
 
       const createdMessages = await Message.insertMany(messages);
+      await Message.populate(createdMessages, MESSAGE_POPULATE);
 
-      // Populate sender and recipient
-      await Message.populate(createdMessages, [
-        { path: 'sender', select: 'name email department role' },
-        { path: 'recipient', select: 'name email department role' }
-      ]);
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         data: createdMessages,
         count: createdMessages.length
       });
-    } else {
-      // Single recipient message
-      if (!recipient) {
-        return res.status(400).json({
-          success: false,
-          message: 'Recipient is required'
-        });
-      }
+    }
 
-      // Check if recipient exists
-      const recipientUser = await User.findById(recipient);
-      if (!recipientUser) {
-        return res.status(404).json({
-          success: false,
-          message: 'Recipient not found'
-        });
-      }
-
-      // Employees can only send to admin
-      if (req.user.role === 'employee' && recipientUser.role !== 'admin') {
-        return res.status(403).json({
-          success: false,
-          message: 'Employees can only send messages to admin'
-        });
-      }
-
-      const message = await Message.create({
-        sender: req.user.id,
-        recipient,
-        subject,
-        content
-      });
-
-      await message.populate('sender', 'name email department role');
-      await message.populate('recipient', 'name email department role');
-
-      res.status(201).json({
-        success: true,
-        data: message
+    if (!recipient) {
+      return res.status(400).json({
+        success: false,
+        message: 'Recipient is required'
       });
     }
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
+
+    const recipientUser = await getOrganizationUserOrThrow(organization._id, recipient);
+
+    if (
+      normalizedRole === 'employee' &&
+      normalizeRole(recipientUser.role) !== 'organization_admin'
+    ) {
+      throw createHttpError(403, 'Employees can only send messages to organization admins');
+    }
+
+    const message = await Message.create(attachOrganizationId({
+      sender: req.user.id,
+      recipient,
+      subject,
+      content
+    }, organization));
+
+    await message.populate(MESSAGE_POPULATE);
+
+    res.status(201).json({
+      success: true,
+      data: message
     });
+  } catch (error) {
+    sendControllerError(res, error);
   }
 };
 
@@ -278,10 +340,11 @@ exports.sendMessage = async (req, res) => {
 // @access  Private
 exports.markAsRead = async (req, res) => {
   try {
-    const message = await Message.findOne({
+    const organization = await resolveMessageOrganization(req);
+    const message = await Message.findOne(buildTenantQuery(organization, {
       _id: req.params.id,
       recipient: req.user.id
-    });
+    }));
 
     if (!message) {
       return res.status(404).json({
@@ -299,10 +362,7 @@ exports.markAsRead = async (req, res) => {
       data: message
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -311,11 +371,12 @@ exports.markAsRead = async (req, res) => {
 // @access  Private
 exports.markAllAsRead = async (req, res) => {
   try {
+    const organization = await resolveMessageOrganization(req);
     const result = await Message.updateMany(
-      {
+      buildTenantQuery(organization, {
         recipient: req.user.id,
         read: false
-      },
+      }),
       {
         read: true,
         readAt: new Date()
@@ -329,10 +390,7 @@ exports.markAllAsRead = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -341,13 +399,14 @@ exports.markAllAsRead = async (req, res) => {
 // @access  Private
 exports.deleteMessage = async (req, res) => {
   try {
-    const message = await Message.findOne({
+    const organization = await resolveMessageOrganization(req);
+    const message = await Message.findOne(buildTenantQuery(organization, {
       _id: req.params.id,
       $or: [
         { sender: req.user.id },
         { recipient: req.user.id }
       ]
-    });
+    }));
 
     if (!message) {
       return res.status(404).json({
@@ -363,10 +422,7 @@ exports.deleteMessage = async (req, res) => {
       data: {}
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
 
@@ -375,9 +431,10 @@ exports.deleteMessage = async (req, res) => {
 // @access  Private
 exports.deleteAllMessages = async (req, res) => {
   try {
-    const result = await Message.deleteMany({
+    const organization = await resolveMessageOrganization(req);
+    const result = await Message.deleteMany(buildTenantQuery(organization, {
       recipient: req.user.id
-    });
+    }));
 
     res.json({
       success: true,
@@ -386,10 +443,6 @@ exports.deleteAllMessages = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendControllerError(res, error);
   }
 };
-
