@@ -71,8 +71,8 @@ const getEmailTemplate = (title, content, language = 'en') => {
   const isRTL = language === 'ar';
   const direction = isRTL ? 'rtl' : 'ltr';
   const textAlign = isRTL ? 'right' : 'left';
-  const primaryColor = '#d4b900'; // primary DEFAULT from tailwind config
-  const secondaryColor = '#9e8b00'; // primary dark from tailwind config
+  const primaryColor = '#10B981'; // primary DEFAULT from tailwind config
+  const secondaryColor = '#059669'; // primary dark from tailwind config
 
   return `
 <!DOCTYPE html>
@@ -82,130 +82,192 @@ const getEmailTemplate = (title, content, language = 'en') => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${title}</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Cairo:wght@400;600;700&display=swap');
+    
     * {
       margin: 0;
       padding: 0;
       box-sizing: border-box;
     }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background-color: #f3f4f6;
-      padding: 20px;
+      font-family: ${isRTL ? "'Cairo', sans-serif" : "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"};
+      background-color: #f9fafb;
+      padding: 40px 20px;
       direction: ${direction};
+      color: #374151;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrapper {
+      width: 100%;
+      table-layout: fixed;
+      background-color: #f9fafb;
+      padding-bottom: 60px;
     }
     .email-container {
       max-width: 600px;
       margin: 0 auto;
       background-color: #ffffff;
-      border-radius: 12px;
+      border-radius: 16px;
       overflow: hidden;
-      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05), 0 1px 3px rgba(0,0,0,0.02);
+      border: 1px solid #f3f4f6;
     }
     .email-header {
-      background: linear-gradient(135deg, ${primaryColor} 0%, ${secondaryColor} 100%);
-      padding: 30px 20px;
+      padding: 40px 40px 20px;
       text-align: center;
-      color: #ffffff;
-    }
-    .email-header img {
-      max-width: 150px;
-      height: auto;
-      margin-bottom: 15px;
+      background-color: #ffffff;
+      border-bottom: 1px solid #f3f4f6;
     }
     .email-header h1 {
-      font-size: 24px;
-      font-weight: bold;
+      font-size: 28px;
+      font-weight: 700;
       margin: 0;
-      color: #ffffff;
+      color: ${primaryColor};
+      letter-spacing: -0.5px;
+    }
+    .email-header p {
+      margin-top: 8px;
+      font-size: 14px;
+      color: #9ca3af;
+      font-weight: 500;
     }
     .email-body {
-      padding: 30px 20px;
-      color: #1f2937;
-      line-height: 1.6;
+      padding: 40px;
+      line-height: 1.7;
     }
     .email-body h2 {
-      font-size: 20px;
+      font-size: 22px;
       font-weight: 600;
-      color: ${primaryColor};
-      margin-bottom: 20px;
+      color: #111827;
+      margin-bottom: 24px;
       text-align: ${textAlign};
     }
     .email-body p {
       font-size: 16px;
-      margin-bottom: 15px;
+      margin-bottom: 20px;
       text-align: ${textAlign};
       color: #4b5563;
     }
-    .email-body .info-box {
-      background-color: #f9fafb;
-      border-left: 4px solid ${primaryColor};
-      padding: 15px;
-      margin: 20px 0;
-      border-radius: 4px;
+    .info-box {
+      background-color: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 24px;
+      margin: 32px 0;
+      position: relative;
     }
-    .email-body .info-box p {
-      margin: 5px 0;
-      font-size: 14px;
+    .info-box::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      ${isRTL ? 'right: 0;' : 'left: 0;'}
+      bottom: 0;
+      width: 4px;
+      background-color: ${primaryColor};
+      border-radius: ${isRTL ? '0 12px 12px 0' : '12px 0 0 12px'};
     }
-    .email-body .info-box strong {
-      color: ${primaryColor};
+    .info-box p {
+      margin: 0 0 12px 0;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+    }
+    .info-box p:last-child {
+      margin-bottom: 0;
+    }
+    .info-box strong {
+      color: #1f2937;
       font-weight: 600;
+      min-width: 120px;
+      display: inline-block;
+    }
+    .email-button-container {
+      text-align: center;
+      margin: 40px 0 20px;
     }
     .email-button {
       display: inline-block;
-      padding: 12px 30px;
+      padding: 14px 32px;
       background-color: ${primaryColor};
       color: #ffffff !important;
       text-decoration: none;
-      border-radius: 6px;
+      border-radius: 8px;
       font-weight: 600;
-      margin: 20px 0;
+      font-size: 16px;
       text-align: center;
+      transition: all 0.2s;
+      box-shadow: 0 4px 6px -1px rgba(16, 185, 129, 0.2), 0 2px 4px -1px rgba(16, 185, 129, 0.1);
     }
     .email-button:hover {
       background-color: ${secondaryColor};
+      transform: translateY(-1px);
     }
     .email-footer {
-      background-color: #f9fafb;
-      padding: 20px;
+      background-color: #f8fafc;
+      padding: 32px 40px;
       text-align: center;
-      border-top: 1px solid #e5e7eb;
-      color: #6b7280;
-      font-size: 14px;
+      border-top: 1px solid #f1f5f9;
     }
     .email-footer p {
-      margin: 5px 0;
+      color: #64748b;
+      font-size: 14px;
+      margin: 8px 0;
+      line-height: 1.5;
     }
-    .divider {
-      height: 1px;
-      background-color: #e5e7eb;
-      margin: 20px 0;
+    .footer-links {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid #e2e8f0;
+    }
+    .text-sm {
+      font-size: 13px !important;
+      color: #94a3b8 !important;
     }
     @media only screen and (max-width: 600px) {
+      body {
+        padding: 20px 10px;
+      }
       .email-container {
         width: 100% !important;
+        border-radius: 12px;
       }
-      .email-body {
-        padding: 20px 15px;
+      .email-header, .email-body, .email-footer {
+        padding: 24px 20px;
+      }
+      .info-box {
+        padding: 20px 16px;
+      }
+      .info-box strong {
+        min-width: auto;
+        display: block;
+        margin-bottom: 4px;
+      }
+      .info-box p {
+        display: block;
+        margin-bottom: 16px;
       }
     }
   </style>
 </head>
 <body>
-  <div class="email-container">
-    <div class="email-header">
-      <h1>Atsha</h1>
-      <p style="margin: 0; font-size: 14px; opacity: 0.9;">${language === 'ar' ? 'نظام إدارة atsha' : 'atsha Management System'}</p>
-    </div>
-    <div class="email-body">
-      ${content}
-    </div>
-    <div class="email-footer">
-      <p><strong>Atsha</strong></p>
-      <p>${language === 'ar' ? '© 2025 atsha. جميع الحقوق محفوظة.' : '© 2025 atsha. All rights reserved.'}</p>
-      <p style="font-size: 12px; margin-top: 10px;">
-        ${language === 'ar' ? 'هذا إيميل تلقائي، يرجى عدم الرد عليه.' : 'This is an automated email, please do not reply.'}
-      </p>
+  <div class="wrapper">
+    <div class="email-container">
+      <div class="email-header">
+        <h1>Atsha</h1>
+        <p>${language === 'ar' ? 'نظام الإدارة المتقدم' : 'Advanced Management System'}</p>
+      </div>
+      <div class="email-body">
+        ${content}
+      </div>
+      <div class="email-footer">
+        <p style="font-weight: 600; color: #475569;">Atsha</p>
+        <p>${language === 'ar' ? '© 2025 atsha. جميع الحقوق محفوظة.' : '© 2025 atsha. All rights reserved.'}</p>
+        <div class="footer-links">
+          <p class="text-sm">
+            ${language === 'ar' ? 'هذه رسالة تلقائية، يرجى عدم الرد عليها مباشرة.' : 'This is an automated message, please do not reply directly to this email.'}
+          </p>
+        </div>
+      </div>
     </div>
   </div>
 </body>
@@ -589,15 +651,15 @@ const getPasswordResetEmail = (resetData, language = 'en') => {
     <p>${isRTL ? `مرحباً ${userName},` : `Hello ${userName},`}</p>
     <p>${isRTL ? 'لقد طلبت إعادة تعيين كلمة المرور لحسابك.' : 'You have requested to reset your password.'}</p>
     <p>${isRTL ? 'انقر على الزر أدناه لإعادة تعيين كلمة المرور:' : 'Click the button below to reset your password:'}</p>
-    <div style="text-align: center; margin: 30px 0;">
-      <a href="${resetLink}" class="email-button" style="display: inline-block; padding: 12px 30px; background-color: #d4b900; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-weight: 600;">
+    <div class="email-button-container">
+      <a href="${resetLink}" class="email-button">
         ${isRTL ? 'إعادة تعيين كلمة المرور' : 'Reset Password'}
       </a>
     </div>
     <p style="font-size: 14px; color: #6b7280;">
       ${isRTL ? `أو انسخ والصق هذا الرابط في المتصفح: ${resetLink}` : `Or copy and paste this link in your browser: ${resetLink}`}
     </p>
-    <p style="font-size: 14px; color: #d4b900;">
+    <p style="font-size: 14px; color: #10B981; font-weight: 500;">
       ${isRTL ? `⚠️ هذا الرابط سينتهي خلال ${expiresIn}.` : `⚠️ This link will expire in ${expiresIn}.`}
     </p>
     <p style="font-size: 14px; color: #6b7280;">
@@ -654,7 +716,7 @@ const getPasswordResetByAdminEmail = (resetData, language = 'en') => {
       <p><strong>${isRTL ? 'تمت إعادة التعيين بواسطة:' : 'Reset By:'}</strong> ${resetBy}</p>
       ${newPassword ? `<p><strong>${isRTL ? 'كلمة المرور الجديدة:' : 'New Password:'}</strong> <code style="background-color: #f3f4f6; padding: 4px 8px; border-radius: 4px; font-family: monospace;">${newPassword}</code></p>` : ''}
     </div>
-    <p style="color: #d4b900; font-weight: 600;">
+    <p style="color: #10B981; font-weight: 600;">
       ${isRTL ? '⚠️ يرجى تغيير كلمة المرور بعد تسجيل الدخول.' : '⚠️ Please change your password after logging in.'}
     </p>
     <p>${isRTL ? 'يمكنك تسجيل الدخول الآن باستخدام كلمة المرور الجديدة.' : 'You can now log in using your new password.'}</p>
@@ -687,7 +749,7 @@ const getInvitationEmail = (invitationData, language = 'en') => {
       ${expiresAt ? `<p><strong>${isRTL ? 'تنتهي الدعوة في:' : 'Invitation Expires:'}</strong> ${expiresAt}</p>` : ''}
     </div>
     <p>${isRTL ? 'استخدم الرابط التالي لإكمال تفعيل حسابك.' : 'Use the link below to complete your account activation.'}</p>
-    <div style="text-align: center; margin: 30px 0;">
+    <div class="email-button-container">
       <a href="${inviteLink}" class="email-button">
         ${isRTL ? 'قبول الدعوة' : 'Accept Invitation'}
       </a>
@@ -710,9 +772,9 @@ const getEmployeeReportEmail = (data, language = 'en') => {
   const content = `
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? `مرحباً ${data.employeeName},` : `Hello ${data.employeeName},`}</p>
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? 'نود إعلامك بأن تقرير الأداء الشهري الخاص بك جاهز. يرجى النقر على الرابط أدناه لعرض التقرير.' : 'We would like to inform you that your monthly performance report is ready. Please click the link below to view your report.'}</p>
-    <div class="info-box" style="background-color: #f9fafb; border-left: 4px solid #d4b900; padding: 15px; margin: 20px 0; border-radius: 4px;">
-      <p style="margin: 5px 0; font-size: 14px;"><strong style="color: #d4b900;">${isRTL ? 'الفترة:' : 'Period:'}</strong> ${data.month} ${data.year}</p>
-      <p style="margin: 5px 0; font-size: 14px;"><strong style="color: #d4b900;">${isRTL ? 'القسم:' : 'Department:'}</strong> ${data.department}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'الفترة:' : 'Period:'}</strong> ${data.month} ${data.year}</p>
+      <p><strong>${isRTL ? 'القسم:' : 'Department:'}</strong> ${data.department}</p>
     </div>
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? 'يرجى الاطلاع على التقرير للحصول على تفاصيل كاملة عن حضورك وإجازاتك وأدائك خلال هذا الشهر.' : 'Please review the report for complete details about your attendance, leaves, and performance during this month.'}</p>
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? 'إذا كان لديك أي استفسارات، يرجى التواصل معنا.' : 'If you have any questions, please feel free to contact us.'}</p>

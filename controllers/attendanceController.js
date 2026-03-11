@@ -38,6 +38,8 @@ const PRIVILEGED_ATTENDANCE_ROLES = new Set([
   'qr_manager'
 ]);
 
+const DEFAULT_QR_TOKEN_VALIDITY_SECONDS = 30;
+
 const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
   success: false,
   message: error.message
@@ -59,6 +61,25 @@ const parsePagination = (page, limit) => {
 const resolveAttendanceOrganization = async (req, fallbackOrganizationId = null) => (
   resolveScopedOrganization(req, fallbackOrganizationId)
 );
+
+const getQrTokenValiditySeconds = (organization) => {
+  const configuredSeconds = parseInt(
+    organization?.attendanceSettings?.qrTokenValiditySeconds,
+    10
+  );
+
+  if (Number.isFinite(configuredSeconds) && configuredSeconds > 0) {
+    return configuredSeconds;
+  }
+
+  const envSeconds = parseInt(process.env.QR_TOKEN_VALIDITY_SECONDS, 10);
+
+  if (Number.isFinite(envSeconds) && envSeconds > 0) {
+    return envSeconds;
+  }
+
+  return DEFAULT_QR_TOKEN_VALIDITY_SECONDS;
+};
 
 const getOrganizationUserOrThrow = async (organizationId, userId, extraQuery = {}) => {
   const user = await User.findOne({
@@ -281,7 +302,7 @@ exports.generateQRCode = async (req, res) => {
     const organization = await resolveAttendanceOrganization(req);
     const sequenceNumber = await AttendanceToken.getNextSequence(organization._id);
     const token = AttendanceToken.generateToken();
-    const validitySeconds = parseInt(process.env.QR_TOKEN_VALIDITY_SECONDS, 10) || 30;
+    const validitySeconds = getQrTokenValiditySeconds(organization);
     const validityMs = validitySeconds * 1000;
     const validFrom = new Date();
     const validTo = new Date(validFrom.getTime() + validityMs);
