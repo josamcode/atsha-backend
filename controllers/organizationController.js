@@ -6,8 +6,10 @@ const { deleteStoredAsset, uploadOrganizationBrandingAsset } = require('../utils
 const { resolveManagedOrganization } = require('../utils/organizationAccess');
 const { formatOrganizationForClient } = require('../utils/organizationFormatter');
 const {
+  getOrganizationPlanQueryValues,
   normalizeDepartmentCode,
-  normalizeDomain
+  normalizeDomain,
+  normalizeOrganizationPlan
 } = require('../utils/tenantConstants');
 
 const BRANDING_ASSET_FIELD_MAP = {
@@ -132,7 +134,9 @@ const sanitizeSubscriptionPatch = (subscription) => {
 
   const patch = {};
 
-  if (subscription.planCode !== undefined) patch.planCode = subscription.planCode;
+  if (subscription.planCode !== undefined) {
+    patch.planCode = normalizeOrganizationPlan(subscription.planCode);
+  }
   if (subscription.status !== undefined) patch.status = subscription.status;
   if (subscription.billingCycle !== undefined) patch.billingCycle = subscription.billingCycle;
   if (subscription.startsAt !== undefined) patch.startsAt = parseDateValue(subscription.startsAt);
@@ -188,7 +192,7 @@ const buildPlatformOrganizationPatch = (body) => {
   if (body.name !== undefined) patch.name = body.name;
   if (body.slug !== undefined) patch.slug = body.slug;
   if (body.status !== undefined) patch.status = body.status;
-  if (body.plan !== undefined) patch.plan = body.plan;
+  if (body.plan !== undefined) patch.plan = normalizeOrganizationPlan(body.plan);
   if (body.locale !== undefined) patch.locale = body.locale;
   if (body.timezone !== undefined) patch.timezone = body.timezone;
 
@@ -435,9 +439,12 @@ exports.listOrganizations = async (req, res) => {
 
     if (status) query.status = status;
     if (plan) {
-      query.plan = plan === 'growth'
-        ? { $in: ['growth', 'standard'] }
-        : plan;
+      const allowedPlanValues = getOrganizationPlanQueryValues(plan);
+      if (allowedPlanValues.length === 1) {
+        query.plan = allowedPlanValues[0];
+      } else if (allowedPlanValues.length > 1) {
+        query.plan = { $in: allowedPlanValues };
+      }
     }
     if (search) {
       query.$or = [

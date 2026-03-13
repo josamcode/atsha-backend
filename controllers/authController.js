@@ -133,9 +133,9 @@ const buildOrganizationRegistrationPayload = async ({ organizationName, organiza
   name: organizationName,
   slug: await resolveAvailableOrganizationSlug(organizationName, organizationSlug),
   status: 'active',
-  plan: 'growth',
+  plan: 'free',
   subscription: {
-    planCode: 'growth',
+    planCode: 'free',
     status: 'active',
     billingCycle: 'monthly',
     startsAt: new Date(),

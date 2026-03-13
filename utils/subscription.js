@@ -1,8 +1,9 @@
-const FormInstance = require('../models/FormInstance');
+﻿const FormInstance = require('../models/FormInstance');
 const FormTemplate = require('../models/FormTemplate');
 const Message = require('../models/Message');
 const SubscriptionUsage = require('../models/SubscriptionUsage');
 const User = require('../models/User');
+const { normalizeOrganizationPlan } = require('./tenantConstants');
 
 const SUBSCRIPTION_FEATURE_KEYS = [
   'qrCode',
@@ -23,12 +24,6 @@ const MONTHLY_LIMIT_KEYS = [
   'messagesPerMonth'
 ];
 
-const LEGACY_PLAN_CODE_MAP = {
-  standard: 'growth',
-  enterprise: 'enterprise',
-  internal: 'internal'
-};
-
 const DEFAULT_DOWNGRADE_PLAN_CODE = 'free';
 
 const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
@@ -36,16 +31,26 @@ const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
     code: 'free',
     name: {
       en: 'Free',
-      ar: 'مجاني'
+      ar: 'ظ…ط¬ط§ظ†ظٹ'
     },
     description: {
       en: 'Entry plan for pilots and very small teams.',
-      ar: 'خطة أولية للتجربة والفرق الصغيرة جداً.'
+      ar: 'ط®ط·ط© ط£ظˆظ„ظٹط© ظ„ظ„طھط¬ط±ط¨ط© ظˆط§ظ„ظپط±ظ‚ ط§ظ„طµط؛ظٹط±ط© ط¬ط¯ط§ظ‹.'
     },
     market: {
       primaryRegion: 'MENA',
       primaryCountry: 'SA',
       currency: 'SAR'
+    },
+    pricing: {
+      monthly: {
+        amount: 0,
+        currency: 'SAR'
+      },
+      yearly: {
+        amount: 0,
+        currency: 'SAR'
+      }
     },
     features: {
       qrCode: false,
@@ -60,20 +65,30 @@ const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
       messagesPerMonth: 0
     }
   },
-  starter: {
-    code: 'starter',
+  plus: {
+    code: 'plus',
     name: {
-      en: 'Starter',
-      ar: 'البداية'
+      en: 'Plus',
+      ar: 'ط¨ظ„ط³'
     },
     description: {
-      en: 'For small Saudi organizations launching structured workflows.',
-      ar: 'للمنظمات الصغيرة التي تبدأ تشغيل النماذج والعمليات بشكل منظم.'
+      en: 'For growing teams that need operational workflows and messaging.',
+      ar: 'ظ„ظ„ظپط±ظ‚ ط§ظ„ظ…طھظ†ط§ظ…ظٹط© ط§ظ„طھظٹ طھط­طھط§ط¬ ط¥ظ„ظ‰ ط³ظٹط± ط¹ظ…ظ„ طھط´ط؛ظٹظ„ظٹ ظˆظ†ط¸ط§ظ… ظ…ط±ط§ط³ظ„ط©.'
     },
     market: {
       primaryRegion: 'MENA',
       primaryCountry: 'SA',
       currency: 'SAR'
+    },
+    pricing: {
+      monthly: {
+        amount: 149,
+        currency: 'SAR'
+      },
+      yearly: {
+        amount: 1490,
+        currency: 'SAR'
+      }
     },
     features: {
       qrCode: true,
@@ -88,20 +103,30 @@ const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
       messagesPerMonth: 1000
     }
   },
-  growth: {
-    code: 'growth',
+  pro: {
+    code: 'pro',
     name: {
-      en: 'Growth',
-      ar: 'النمو'
+      en: 'Pro',
+      ar: 'ط¨ط±ظˆ'
     },
     description: {
-      en: 'For growing GCC organizations that need the full operating suite.',
-      ar: 'للمنظمات المتنامية في الخليج التي تحتاج إلى باقة تشغيل متكاملة.'
+      en: 'Full operating suite for larger organizations and regional rollout.',
+      ar: 'ط¨ط§ظ‚ط© طھط´ط؛ظٹظ„ ظ…طھظƒط§ظ…ظ„ط© ظ„ظ„ظ…ظ†ط¸ظ…ط§طھ ط§ظ„ط£ظƒط¨ط± ظˆظ„ظ„طھظˆط³ط¹ ط§ظ„ط¥ظ‚ظ„ظٹظ…ظٹ.'
     },
     market: {
       primaryRegion: 'MENA',
       primaryCountry: 'SA',
       currency: 'SAR'
+    },
+    pricing: {
+      monthly: {
+        amount: 349,
+        currency: 'SAR'
+      },
+      yearly: {
+        amount: 3490,
+        currency: 'SAR'
+      }
     },
     features: {
       qrCode: true,
@@ -116,62 +141,6 @@ const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
       messagesPerMonth: 20000
     }
   },
-  enterprise: {
-    code: 'enterprise',
-    name: {
-      en: 'Enterprise',
-      ar: 'المؤسسات'
-    },
-    description: {
-      en: 'High-scale deployment with custom commercial terms.',
-      ar: 'تشغيل على نطاق كبير بشروط تجارية مخصصة.'
-    },
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
-    },
-    features: {
-      qrCode: true,
-      attendanceManagement: true,
-      leaveManagement: true,
-      messaging: true
-    },
-    limits: {
-      formsPerMonth: null,
-      templatesTotal: null,
-      usersTotal: null,
-      messagesPerMonth: null
-    }
-  },
-  internal: {
-    code: 'internal',
-    name: {
-      en: 'Internal',
-      ar: 'داخلي'
-    },
-    description: {
-      en: 'Internal unrestricted plan for platform operations.',
-      ar: 'خطة داخلية غير مقيدة لاستخدامات المنصة.'
-    },
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
-    },
-    features: {
-      qrCode: true,
-      attendanceManagement: true,
-      leaveManagement: true,
-      messaging: true
-    },
-    limits: {
-      formsPerMonth: null,
-      templatesTotal: null,
-      usersTotal: null,
-      messagesPerMonth: null
-    }
-  }
 });
 
 const createSubscriptionError = (
@@ -188,15 +157,12 @@ const createSubscriptionError = (
 };
 
 const normalizePlanCode = (value) => {
-  const normalizedValue = String(value || '')
-    .trim()
-    .toLowerCase();
-
+  const normalizedValue = normalizeOrganizationPlan(value);
   if (!normalizedValue) {
     return DEFAULT_DOWNGRADE_PLAN_CODE;
   }
 
-  return LEGACY_PLAN_CODE_MAP[normalizedValue] || normalizedValue;
+  return normalizedValue;
 };
 
 const normalizeLimitValue = (value) => {
@@ -376,7 +342,7 @@ const resolveSubscriptionWindow = (organization, now = new Date()) => {
     subscription.downgradePlanCode || DEFAULT_DOWNGRADE_PLAN_CODE
   );
   const subscribedPlanCode = normalizePlanCode(
-    subscription.planCode || organization?.plan || 'growth'
+    subscription.planCode || organization?.plan || 'free'
   );
   const isExpired = Boolean(endsAt && new Date(endsAt) <= now);
   const inGrace = Boolean(graceEndsAt && new Date(graceEndsAt) > now);

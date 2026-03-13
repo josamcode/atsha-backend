@@ -29,12 +29,24 @@ const FORM_VISIBILITY_ROLE_VALUES = [
 const ORGANIZATION_STATUS_VALUES = ['active', 'inactive', 'suspended'];
 const ORGANIZATION_PLAN_VALUES = [
   'free',
-  'starter',
-  'growth',
-  'standard',
-  'enterprise',
-  'internal'
+  'plus',
+  'pro'
 ];
+const ORGANIZATION_PLAN_ALIASES = {
+  free: 'free',
+  plus: 'plus',
+  pro: 'pro',
+  starter: 'plus',
+  growth: 'pro',
+  standard: 'pro',
+  enterprise: 'pro',
+  internal: 'pro'
+};
+const ORGANIZATION_PLAN_QUERY_VALUES = {
+  free: ['free'],
+  plus: ['plus', 'starter'],
+  pro: ['pro', 'growth', 'standard', 'enterprise', 'internal']
+};
 
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const departmentCodePattern = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
@@ -72,6 +84,29 @@ const normalizeDomain = (value) => {
   }
 
   return value.trim().toLowerCase();
+};
+
+const normalizeOrganizationPlan = (value) => {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  const normalizedValue = value.trim().toLowerCase();
+  if (!normalizedValue) {
+    return null;
+  }
+
+  return ORGANIZATION_PLAN_ALIASES[normalizedValue] || normalizedValue;
+};
+
+const getOrganizationPlanQueryValues = (value) => {
+  const normalizedPlan = normalizeOrganizationPlan(value);
+
+  if (!normalizedPlan) {
+    return [];
+  }
+
+  return ORGANIZATION_PLAN_QUERY_VALUES[normalizedPlan] || [normalizedPlan];
 };
 
 const isValidSlug = (value) => {
@@ -129,10 +164,12 @@ module.exports = {
   ORGANIZATION_STATUS_VALUES,
   ROLE_ALIASES,
   USER_ROLE_VALUES,
+  getOrganizationPlanQueryValues,
   isValidDepartmentCode,
   isValidSlug,
   normalizeDepartmentCode,
   normalizeDomain,
+  normalizeOrganizationPlan,
   normalizeRole,
   roleMatches,
   slugPattern,

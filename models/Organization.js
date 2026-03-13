@@ -6,7 +6,8 @@ const {
   isValidDepartmentCode,
   isValidSlug,
   normalizeDepartmentCode,
-  normalizeDomain
+  normalizeDomain,
+  normalizeOrganizationPlan
 } = require('../utils/tenantConstants');
 
 const titleizeDepartment = (value) => value
@@ -89,7 +90,7 @@ const organizationSchema = new mongoose.Schema({
   plan: {
     type: String,
     enum: ORGANIZATION_PLAN_VALUES,
-    default: 'growth'
+    default: 'free'
   },
   subscription: {
     planCode: {
@@ -311,12 +312,21 @@ organizationSchema.pre('validate', function (next) {
     this.subscription = {};
   }
 
+  if (this.plan) {
+    this.plan = normalizeOrganizationPlan(this.plan);
+  }
+
   if (!this.subscription.planCode && this.plan) {
     this.subscription.planCode = this.plan;
   }
 
   if (this.subscription.planCode) {
+    this.subscription.planCode = normalizeOrganizationPlan(this.subscription.planCode);
     this.plan = this.subscription.planCode;
+  }
+
+  if (this.subscription.downgradePlanCode) {
+    this.subscription.downgradePlanCode = normalizeOrganizationPlan(this.subscription.downgradePlanCode);
   }
 
   next();

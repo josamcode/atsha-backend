@@ -19,7 +19,7 @@ const connectDB = async () => {
 const createOrganization = async (payload) => {
   return Organization.create({
     status: 'active',
-    plan: 'enterprise',
+    plan: 'pro',
     locale: 'en',
     timezone: 'Africa/Cairo',
     securitySettings: {
