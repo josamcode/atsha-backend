@@ -260,6 +260,63 @@ const findLoginUserWithoutOrganization = async (email, password) => {
   return { user, organization, error: null };
 };
 
+const resolvePasswordResetTargets = async (email, scopedOrganization = null) => {
+  const normalizedEmail = normalizeEmail(email);
+  const users = await User.find(
+    scopedOrganization
+      ? buildOrganizationScopedEmailQuery(normalizedEmail, scopedOrganization._id)
+      : { email: normalizedEmail }
+  ).select('+resetPasswordToken +resetPasswordExpire');
+
+  if (users.length === 0) {
+    return [];
+  }
+
+  if (scopedOrganization) {
+    return users.map((user) => ({
+      user,
+      organization: scopedOrganization
+    }));
+  }
+
+  const organizationIds = [...new Set(
+    users
+      .map((user) => user.organizationId ? String(user.organizationId) : null)
+      .filter(Boolean)
+  )];
+
+  const organizations = organizationIds.length > 0
+    ? await Organization.find({ _id: { $in: organizationIds } }).lean()
+    : [];
+  const organizationsById = new Map(
+    organizations.map((organization) => [String(organization._id), organization])
+  );
+
+  const targets = [];
+  for (const user of users) {
+    const organization = user.organizationId
+      ? organizationsById.get(String(user.organizationId)) || null
+      : await resolveOrganizationForUser(user);
+
+    if (!organization) {
+      continue;
+    }
+
+    targets.push({ user, organization });
+  }
+
+  return targets;
+};
+
+const getActivePasswordResetTargets = (targets = []) => targets.filter(({ user, organization }) => (
+  Boolean(user && organization)
+  && user.isActive !== false
+  && organization.status === 'active'
+));
+
+const getSelfServicePasswordResetTargets = (targets = []) => getActivePasswordResetTargets(targets)
+  .filter(({ organization }) => organization.securitySettings?.passwordResetEnabled !== false);
+
 const buildScopedUserQuery = (userId, organizationId) => {
   const query = { _id: userId };
 
@@ -1047,11 +1104,6 @@ exports.changePassword = async (req, res) => {
 // @access  Public
 exports.forgotPassword = async (req, res) => {
   try {
-    const organization = getActiveOrganization(req, res);
-    if (!organization) {
-      return;
-    }
-
     const { email } = req.body;
 
     if (!email) {
@@ -1061,37 +1113,50 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
-    const user = await User.findOne(
-      buildOrganizationScopedEmailQuery(email, organization._id)
-    ).select('+resetPasswordToken +resetPasswordExpire');
+    let scopedOrganization = req.organization || null;
+    if (scopedOrganization) {
+      scopedOrganization = getActiveOrganization(req, res);
+      if (!scopedOrganization) {
+        return;
+      }
+    }
 
-    if (!user) {
+    const targets = await resolvePasswordResetTargets(email, scopedOrganization);
+    const selfServiceTargets = getSelfServicePasswordResetTargets(targets);
+
+    if (targets.length === 0) {
       return res.json({
         success: true,
         message: 'If an account with that email exists, a password reset link has been sent'
       });
     }
 
-    if (!ensureUserBelongsToOrganization(user, organization, res)) {
-      return;
+    if (selfServiceTargets.length === 0) {
+      return res.json({
+        success: true,
+        requiresAdminReset: true,
+        message: 'Self-service password reset is disabled for this account. Please request a password reset from an administrator.'
+      });
     }
 
-    const resetToken = generateResetToken();
-    const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-
-    user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpire = Date.now() + 60 * 60 * 1000;
-    await user.save();
-
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    const resetUrl = `${frontendUrl}/reset-password/${resetToken}?organization=${organization.slug}`;
 
-    const userLanguage = user.languagePreference || 'ar';
-    await sendEmailToUser(user.email, (language) => getPasswordResetEmail({
-      resetLink: resetUrl,
-      userName: user.name,
-      expiresIn: '1 hour'
-    }, language), userLanguage);
+    for (const { user } of selfServiceTargets) {
+      const resetToken = generateResetToken();
+      const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+      user.resetPasswordToken = hashedToken;
+      user.resetPasswordExpire = Date.now() + 60 * 60 * 1000;
+      await user.save();
+
+      const resetUrl = `${frontendUrl}/reset-password/${resetToken}`;
+      const userLanguage = user.languagePreference || 'ar';
+      await sendEmailToUser(user.email, (language) => getPasswordResetEmail({
+        resetLink: resetUrl,
+        userName: user.name,
+        expiresIn: '1 hour'
+      }, language), userLanguage);
+    }
 
     res.json({
       success: true,
@@ -1183,11 +1248,6 @@ exports.resetPassword = async (req, res) => {
 // @access  Public
 exports.requestPasswordReset = async (req, res) => {
   try {
-    const organization = getActiveOrganization(req, res);
-    if (!organization) {
-      return;
-    }
-
     const { email } = req.body;
 
     if (!email) {
@@ -1197,35 +1257,43 @@ exports.requestPasswordReset = async (req, res) => {
       });
     }
 
-    const user = await User.findOne(
-      buildOrganizationScopedEmailQuery(email, organization._id)
+    let scopedOrganization = req.organization || null;
+    if (scopedOrganization) {
+      scopedOrganization = getActiveOrganization(req, res);
+      if (!scopedOrganization) {
+        return;
+      }
+    }
+
+    const targets = getActivePasswordResetTargets(
+      await resolvePasswordResetTargets(email, scopedOrganization)
     );
 
-    if (!user) {
+    if (targets.length === 0) {
       return res.json({
         success: true,
         message: 'If an account with that email exists, a password reset request has been sent to administrators'
       });
     }
 
-    if (!ensureUserBelongsToOrganization(user, organization, res)) {
-      return;
+    const requestDate = new Date();
+
+    for (const { user, organization } of targets) {
+      user.passwordResetRequested = true;
+      user.passwordResetRequestDate = requestDate;
+      await user.save();
+
+      await sendEmailToAdmins(
+        (language) => getPasswordResetRequestEmail({
+          userName: user.name,
+          userEmail: user.email,
+          department: user.department,
+          requestDate
+        }, language),
+        user.department,
+        organization._id
+      );
     }
-
-    user.passwordResetRequested = true;
-    user.passwordResetRequestDate = Date.now();
-    await user.save();
-
-    await sendEmailToAdmins(
-      (language) => getPasswordResetRequestEmail({
-        userName: user.name,
-        userEmail: user.email,
-        department: user.department,
-        requestDate: user.passwordResetRequestDate
-      }, language),
-      user.department,
-      organization._id
-    );
 
     res.json({
       success: true,
