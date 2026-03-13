@@ -51,6 +51,23 @@ const resolveMessageOrganization = async (req, fallbackOrganizationId = null) =>
   resolveScopedOrganization(req, fallbackOrganizationId)
 );
 
+const buildSystemMessagePayload = ({
+  senderId,
+  recipientUser,
+  subject,
+  content,
+  isBroadcast = false,
+  broadcastRecipients = []
+}) => ({
+  organizationId: recipientUser?.organizationId || null,
+  sender: senderId,
+  recipient: recipientUser._id,
+  subject,
+  content,
+  isBroadcast,
+  broadcastRecipients
+});
+
 const getOrganizationUserOrThrow = async (organizationId, userId) => {
   const user = await User.findOne({
     _id: userId,
@@ -259,7 +276,9 @@ exports.sendMessage = async (req, res) => {
       subject,
       content,
       isBroadcast,
-      recipients
+      recipients,
+      scope,
+      selectAllUsers
     } = req.body;
 
     if (!subject || !content) {
@@ -270,53 +289,94 @@ exports.sendMessage = async (req, res) => {
     }
 
     const normalizedRole = normalizeRole(req.user.role);
+    const isPlatformAdminSystemScope = normalizedRole === 'platform_admin' && scope === 'system';
 
     if (isBroadcast) {
       if (!BROADCAST_ALLOWED_ROLES.has(normalizedRole)) {
-        throw createHttpError(403, 'Only organization admins can send broadcast messages');
+        throw createHttpError(403, 'Only platform or organization admins can send broadcast messages');
       }
 
-      if (!Array.isArray(recipients) || recipients.length === 0) {
+      if (!selectAllUsers && (!Array.isArray(recipients) || recipients.length === 0)) {
         throw createHttpError(400, 'Recipients are required for broadcast messages');
       }
 
-      const uniqueRecipientIds = [...new Set(
-        recipients
-          .map((value) => String(value))
-          .filter(Boolean)
-      )];
+      let recipientUsers = [];
 
-      const recipientUsers = await User.find({
-        organizationId: organization._id,
-        _id: { $in: uniqueRecipientIds }
-      })
-        .select('_id organizationId name email department role')
-        .lean();
+      if (isPlatformAdminSystemScope && selectAllUsers) {
+        recipientUsers = await User.find({
+          _id: { $ne: req.user.id },
+          isActive: true
+        })
+          .select('_id organizationId name email department role')
+          .lean();
+      } else {
+        const uniqueRecipientIds = [...new Set(
+          recipients
+            .map((value) => String(value))
+            .filter((value) => value && String(value) !== String(req.user.id))
+        )];
 
-      if (recipientUsers.length !== uniqueRecipientIds.length) {
-        throw createHttpError(400, 'One or more recipients are invalid for this organization');
+        recipientUsers = await User.find(
+          isPlatformAdminSystemScope
+            ? {
+              _id: { $in: uniqueRecipientIds },
+              isActive: true
+            }
+            : {
+              organizationId: organization._id,
+              _id: { $in: uniqueRecipientIds }
+            }
+        )
+          .select('_id organizationId name email department role')
+          .lean();
+
+        if (recipientUsers.length !== uniqueRecipientIds.length) {
+          throw createHttpError(
+            400,
+            isPlatformAdminSystemScope
+              ? 'One or more recipients are invalid'
+              : 'One or more recipients are invalid for this organization'
+          );
+        }
       }
 
-      await assertMessageSendAvailable(organization, recipientUsers.length);
+      if (recipientUsers.length === 0) {
+        throw createHttpError(400, 'No recipients were found for this message');
+      }
+
+      if (!isPlatformAdminSystemScope) {
+        await assertMessageSendAvailable(organization, recipientUsers.length);
+      }
 
       const messages = recipientUsers.map((recipientUser) => (
-        attachOrganizationId({
-          sender: req.user.id,
-          recipient: recipientUser._id,
-          subject,
-          content,
-          isBroadcast: true,
-          broadcastRecipients: recipientUsers.map((user) => user._id)
-        }, organization)
+        isPlatformAdminSystemScope
+          ? buildSystemMessagePayload({
+            senderId: req.user.id,
+            recipientUser,
+            subject,
+            content,
+            isBroadcast: true,
+            broadcastRecipients: recipientUsers.map((user) => user._id)
+          })
+          : attachOrganizationId({
+            sender: req.user.id,
+            recipient: recipientUser._id,
+            subject,
+            content,
+            isBroadcast: true,
+            broadcastRecipients: recipientUsers.map((user) => user._id)
+          }, organization)
       ));
 
       const createdMessages = await Message.insertMany(messages);
       await Message.populate(createdMessages, MESSAGE_POPULATE);
-      await incrementMonthlyUsage({
-        organizationId: organization._id,
-        metric: 'messagesPerMonth',
-        amount: createdMessages.length
-      });
+      if (!isPlatformAdminSystemScope) {
+        await incrementMonthlyUsage({
+          organizationId: organization._id,
+          metric: 'messagesPerMonth',
+          amount: createdMessages.length
+        });
+      }
 
       return res.status(201).json({
         success: true,
@@ -332,30 +392,55 @@ exports.sendMessage = async (req, res) => {
       });
     }
 
-    await assertMessageSendAvailable(organization, 1);
+    let recipientUser;
+    if (isPlatformAdminSystemScope) {
+      recipientUser = await User.findOne({
+        _id: recipient,
+        isActive: true
+      })
+        .select('_id organizationId name email department role isActive')
+        .lean();
 
-    const recipientUser = await getOrganizationUserOrThrow(organization._id, recipient);
+      if (!recipientUser) {
+        throw createHttpError(404, 'Recipient not found');
+      }
+    } else {
+      await assertMessageSendAvailable(organization, 1);
+      recipientUser = await getOrganizationUserOrThrow(organization._id, recipient);
+    }
 
     if (
+      !isPlatformAdminSystemScope &&
       normalizedRole === 'employee' &&
       normalizeRole(recipientUser.role) !== 'organization_admin'
     ) {
       throw createHttpError(403, 'Employees can only send messages to organization admins');
     }
 
-    const message = await Message.create(attachOrganizationId({
-      sender: req.user.id,
-      recipient,
-      subject,
-      content
-    }, organization));
+    const message = await Message.create(
+      isPlatformAdminSystemScope
+        ? buildSystemMessagePayload({
+          senderId: req.user.id,
+          recipientUser,
+          subject,
+          content
+        })
+        : attachOrganizationId({
+          sender: req.user.id,
+          recipient,
+          subject,
+          content
+        }, organization)
+    );
 
     await message.populate(MESSAGE_POPULATE);
-    await incrementMonthlyUsage({
-      organizationId: organization._id,
-      metric: 'messagesPerMonth',
-      amount: 1
-    });
+    if (!isPlatformAdminSystemScope) {
+      await incrementMonthlyUsage({
+        organizationId: organization._id,
+        metric: 'messagesPerMonth',
+        amount: 1
+      });
+    }
 
     res.status(201).json({
       success: true,

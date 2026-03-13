@@ -1,9 +1,11 @@
-﻿const FormInstance = require('../models/FormInstance');
+const FormInstance = require('../models/FormInstance');
 const FormTemplate = require('../models/FormTemplate');
 const Message = require('../models/Message');
+const SubscriptionPlan = require('../models/SubscriptionPlan');
 const SubscriptionUsage = require('../models/SubscriptionUsage');
 const User = require('../models/User');
 const { normalizeOrganizationPlan } = require('./tenantConstants');
+const { DEFAULT_SUBSCRIPTION_PLANS } = require('./platformDefaults');
 
 const SUBSCRIPTION_FEATURE_KEYS = [
   'qrCode',
@@ -25,123 +27,6 @@ const MONTHLY_LIMIT_KEYS = [
 ];
 
 const DEFAULT_DOWNGRADE_PLAN_CODE = 'free';
-
-const DEFAULT_SUBSCRIPTION_PLANS = Object.freeze({
-  free: {
-    code: 'free',
-    name: {
-      en: 'Free',
-      ar: 'ظ…ط¬ط§ظ†ظٹ'
-    },
-    description: {
-      en: 'Entry plan for pilots and very small teams.',
-      ar: 'ط®ط·ط© ط£ظˆظ„ظٹط© ظ„ظ„طھط¬ط±ط¨ط© ظˆط§ظ„ظپط±ظ‚ ط§ظ„طµط؛ظٹط±ط© ط¬ط¯ط§ظ‹.'
-    },
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
-    },
-    pricing: {
-      monthly: {
-        amount: 0,
-        currency: 'SAR'
-      },
-      yearly: {
-        amount: 0,
-        currency: 'SAR'
-      }
-    },
-    features: {
-      qrCode: false,
-      attendanceManagement: false,
-      leaveManagement: false,
-      messaging: false
-    },
-    limits: {
-      formsPerMonth: 100,
-      templatesTotal: 3,
-      usersTotal: 5,
-      messagesPerMonth: 0
-    }
-  },
-  plus: {
-    code: 'plus',
-    name: {
-      en: 'Plus',
-      ar: 'ط¨ظ„ط³'
-    },
-    description: {
-      en: 'For growing teams that need operational workflows and messaging.',
-      ar: 'ظ„ظ„ظپط±ظ‚ ط§ظ„ظ…طھظ†ط§ظ…ظٹط© ط§ظ„طھظٹ طھط­طھط§ط¬ ط¥ظ„ظ‰ ط³ظٹط± ط¹ظ…ظ„ طھط´ط؛ظٹظ„ظٹ ظˆظ†ط¸ط§ظ… ظ…ط±ط§ط³ظ„ط©.'
-    },
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
-    },
-    pricing: {
-      monthly: {
-        amount: 149,
-        currency: 'SAR'
-      },
-      yearly: {
-        amount: 1490,
-        currency: 'SAR'
-      }
-    },
-    features: {
-      qrCode: true,
-      attendanceManagement: true,
-      leaveManagement: false,
-      messaging: true
-    },
-    limits: {
-      formsPerMonth: 1000,
-      templatesTotal: 15,
-      usersTotal: 25,
-      messagesPerMonth: 1000
-    }
-  },
-  pro: {
-    code: 'pro',
-    name: {
-      en: 'Pro',
-      ar: 'ط¨ط±ظˆ'
-    },
-    description: {
-      en: 'Full operating suite for larger organizations and regional rollout.',
-      ar: 'ط¨ط§ظ‚ط© طھط´ط؛ظٹظ„ ظ…طھظƒط§ظ…ظ„ط© ظ„ظ„ظ…ظ†ط¸ظ…ط§طھ ط§ظ„ط£ظƒط¨ط± ظˆظ„ظ„طھظˆط³ط¹ ط§ظ„ط¥ظ‚ظ„ظٹظ…ظٹ.'
-    },
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
-    },
-    pricing: {
-      monthly: {
-        amount: 349,
-        currency: 'SAR'
-      },
-      yearly: {
-        amount: 3490,
-        currency: 'SAR'
-      }
-    },
-    features: {
-      qrCode: true,
-      attendanceManagement: true,
-      leaveManagement: true,
-      messaging: true
-    },
-    limits: {
-      formsPerMonth: 10000,
-      templatesTotal: 150,
-      usersTotal: 200,
-      messagesPerMonth: 20000
-    }
-  },
-});
 
 const createSubscriptionError = (
   statusCode,
@@ -188,10 +73,180 @@ const normalizeFeatureValue = (value) => {
 
 const isUnlimited = (value) => value === null || value === undefined;
 
-const getPlanDefinition = (planCode) => {
+const buildEmptyPlanDefinition = (planCode = DEFAULT_DOWNGRADE_PLAN_CODE) => ({
+  code: normalizePlanCode(planCode),
+  name: {
+    en: String(planCode || DEFAULT_DOWNGRADE_PLAN_CODE).toUpperCase(),
+    ar: String(planCode || DEFAULT_DOWNGRADE_PLAN_CODE).toUpperCase()
+  },
+  description: {
+    en: '',
+    ar: ''
+  },
+  market: {
+    primaryRegion: 'MENA',
+    primaryCountry: 'SA',
+    currency: 'SAR'
+  },
+  pricing: {
+    monthly: {
+      amount: 0,
+      currency: 'SAR'
+    },
+    yearly: {
+      amount: 0,
+      currency: 'SAR'
+    }
+  },
+  features: {
+    qrCode: false,
+    attendanceManagement: false,
+    leaveManagement: false,
+    messaging: false
+  },
+  limits: {
+    formsPerMonth: null,
+    templatesTotal: null,
+    usersTotal: null,
+    messagesPerMonth: null
+  },
+  isActive: true,
+  sortOrder: 0
+});
+
+const clonePlanRecord = (value) => JSON.parse(JSON.stringify(value || {}));
+
+const normalizePlanRecord = (source, fallback = {}) => {
+  const baseValue = buildEmptyPlanDefinition(source?.code || fallback?.code);
+  const mergedValue = {
+    ...baseValue,
+    ...clonePlanRecord(fallback),
+    ...clonePlanRecord(source),
+    name: {
+      ...baseValue.name,
+      ...(fallback?.name || {}),
+      ...(source?.name || {})
+    },
+    description: {
+      ...baseValue.description,
+      ...(fallback?.description || {}),
+      ...(source?.description || {})
+    },
+    market: {
+      ...baseValue.market,
+      ...(fallback?.market || {}),
+      ...(source?.market || {})
+    },
+    pricing: {
+      monthly: {
+        ...baseValue.pricing.monthly,
+        ...(fallback?.pricing?.monthly || {}),
+        ...(source?.pricing?.monthly || {})
+      },
+      yearly: {
+        ...baseValue.pricing.yearly,
+        ...(fallback?.pricing?.yearly || {}),
+        ...(source?.pricing?.yearly || {})
+      }
+    },
+    features: {
+      ...baseValue.features,
+      ...(fallback?.features || {}),
+      ...(source?.features || {})
+    },
+    limits: {
+      ...baseValue.limits,
+      ...(fallback?.limits || {}),
+      ...(source?.limits || {})
+    }
+  };
+
+  mergedValue.code = normalizePlanCode(mergedValue.code);
+  mergedValue.isActive = mergedValue.isActive !== false;
+  mergedValue.sortOrder = Number.isFinite(Number(mergedValue.sortOrder))
+    ? Number(mergedValue.sortOrder)
+    : 0;
+
+  SUBSCRIPTION_LIMIT_KEYS.forEach((limitKey) => {
+    mergedValue.limits[limitKey] = normalizeLimitValue(mergedValue.limits?.[limitKey]);
+  });
+
+  SUBSCRIPTION_FEATURE_KEYS.forEach((featureKey) => {
+    mergedValue.features[featureKey] = Boolean(mergedValue.features?.[featureKey]);
+  });
+
+  return mergedValue;
+};
+
+const getSubscriptionPlans = async ({ includeInactive = false } = {}) => {
+  const storedPlans = await SubscriptionPlan.find({})
+    .sort({ sortOrder: 1, createdAt: 1 })
+    .lean();
+
+  const defaultPlans = Object.values(DEFAULT_SUBSCRIPTION_PLANS)
+    .sort((left, right) => (left.sortOrder ?? 0) - (right.sortOrder ?? 0));
+  const planMap = new Map(
+    defaultPlans.map((plan, index) => {
+      const normalizedPlan = normalizePlanRecord(plan, {
+        sortOrder: plan.sortOrder ?? index
+      });
+
+      return [normalizedPlan.code, {
+        ...normalizedPlan,
+        isDefault: true,
+        source: 'default'
+      }];
+    })
+  );
+
+  storedPlans.forEach((storedPlan, index) => {
+    const normalizedCode = normalizePlanCode(storedPlan.code);
+    const existingPlan = planMap.get(normalizedCode);
+    const normalizedPlan = normalizePlanRecord(storedPlan, existingPlan || {
+      ...buildEmptyPlanDefinition(normalizedCode),
+      sortOrder: defaultPlans.length + index
+    });
+
+    planMap.set(normalizedCode, {
+      ...normalizedPlan,
+      isDefault: Boolean(DEFAULT_SUBSCRIPTION_PLANS[normalizedCode]),
+      source: DEFAULT_SUBSCRIPTION_PLANS[normalizedCode]
+        ? 'customized_default'
+        : 'custom'
+    });
+  });
+
+  return Array.from(planMap.values())
+    .filter((plan) => includeInactive || plan.isActive !== false)
+    .sort((left, right) => {
+      const sortDifference = (left.sortOrder ?? 0) - (right.sortOrder ?? 0);
+      if (sortDifference !== 0) {
+        return sortDifference;
+      }
+
+      return String(left.code || '').localeCompare(String(right.code || ''));
+    });
+};
+
+const getPlanCatalogMap = async (options = {}) => {
+  const plans = await getSubscriptionPlans({
+    includeInactive: true,
+    ...options
+  });
+
+  return plans.reduce((result, plan) => {
+    result[plan.code] = plan;
+    return result;
+  }, {});
+};
+
+const getPlanDefinition = async (planCode) => {
   const normalizedPlanCode = normalizePlanCode(planCode);
-  return DEFAULT_SUBSCRIPTION_PLANS[normalizedPlanCode]
-    || DEFAULT_SUBSCRIPTION_PLANS[DEFAULT_DOWNGRADE_PLAN_CODE];
+  const planCatalogMap = await getPlanCatalogMap();
+
+  return planCatalogMap[normalizedPlanCode]
+    || planCatalogMap[DEFAULT_DOWNGRADE_PLAN_CODE]
+    || normalizePlanRecord(DEFAULT_SUBSCRIPTION_PLANS[DEFAULT_DOWNGRADE_PLAN_CODE]);
 };
 
 const buildMonthlyPeriod = (date = new Date()) => {
@@ -342,7 +397,7 @@ const resolveSubscriptionWindow = (organization, now = new Date()) => {
     subscription.downgradePlanCode || DEFAULT_DOWNGRADE_PLAN_CODE
   );
   const subscribedPlanCode = normalizePlanCode(
-    subscription.planCode || organization?.plan || 'free'
+    subscription.planCode || organization?.plan || DEFAULT_DOWNGRADE_PLAN_CODE
   );
   const isExpired = Boolean(endsAt && new Date(endsAt) <= now);
   const inGrace = Boolean(graceEndsAt && new Date(graceEndsAt) > now);
@@ -369,9 +424,12 @@ const resolveSubscriptionWindow = (organization, now = new Date()) => {
   };
 };
 
-const buildEntitlements = ({ organization, windowState }) => {
-  const effectivePlan = getPlanDefinition(windowState.effectivePlanCode);
-  const subscribedPlan = getPlanDefinition(windowState.subscribedPlanCode);
+const buildEntitlements = ({ organization, windowState, planCatalogMap }) => {
+  const effectivePlan = planCatalogMap[windowState.effectivePlanCode]
+    || planCatalogMap[DEFAULT_DOWNGRADE_PLAN_CODE]
+    || normalizePlanRecord(DEFAULT_SUBSCRIPTION_PLANS[DEFAULT_DOWNGRADE_PLAN_CODE]);
+  const subscribedPlan = planCatalogMap[windowState.subscribedPlanCode]
+    || effectivePlan;
   const shouldApplyCustomOverrides = !windowState.isDowngraded;
   const customLimits = shouldApplyCustomOverrides
     ? organization?.subscription?.customLimits || {}
@@ -418,9 +476,11 @@ const resolveOrganizationSubscription = async (organization, options = {}) => {
   const { includeUsage = false } = options;
   const now = new Date();
   const windowState = resolveSubscriptionWindow(organization, now);
+  const planCatalogMap = await getPlanCatalogMap();
   const entitlements = buildEntitlements({
     organization,
-    windowState
+    windowState,
+    planCatalogMap
   });
 
   const result = {
@@ -564,7 +624,7 @@ const assertUserSeatAvailable = async (organization) => {
     organization,
     limitKey: 'usersTotal',
     currentUsage: activeUsers,
-    message: 'Your organization has reached the active user limit for the current subscription.'
+    message: 'لقد وصلت مؤسستك إلى الحد الأقصى لعدد المستخدمين النشطين في الاشتراك الحالي.'
   });
 };
 
@@ -574,7 +634,7 @@ const assertTemplateCreationAvailable = async (organization) => {
     organization,
     limitKey: 'templatesTotal',
     currentUsage: templatesTotal,
-    message: 'Your organization has reached the template limit for the current subscription.'
+    message: 'لقد وصلت مؤسستك إلى الحد الأقصى لعدد القوالب في الاشتراك الحالي.'
   });
 };
 
@@ -584,7 +644,7 @@ const assertFormCreationAvailable = async (organization) => {
     organization,
     limitKey: 'formsPerMonth',
     currentUsage: formsPerMonthUsed,
-    message: 'Your organization has reached the monthly forms limit for the current subscription.'
+    message: 'لقد وصلت مؤسستك إلى الحد الأقصى لعدد النماذج المسموح بها شهريًا في الاشتراك الحالي.'
   });
 };
 
@@ -595,7 +655,7 @@ const assertMessageSendAvailable = async (organization, incrementBy = 1) => {
     limitKey: 'messagesPerMonth',
     currentUsage: messagesPerMonthUsed,
     incrementBy,
-    message: 'Your organization has reached the monthly messaging limit for the current subscription.'
+    message: 'لقد وصلت مؤسستك إلى الحد الأقصى لعدد الرسائل المسموح بها شهريًا في الاشتراك الحالي.'
   });
 };
 
@@ -688,6 +748,7 @@ module.exports = {
   getCurrentUsageValue,
   getLockedTemplateIdSet,
   getPlanDefinition,
+  getSubscriptionPlans,
   incrementMonthlyUsage,
   isUnlimited,
   normalizePlanCode,

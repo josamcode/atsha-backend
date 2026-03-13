@@ -135,6 +135,7 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/messages', require('./routes/messages'));
 app.use('/api/organizations', require('./routes/organizations'));
 app.use('/api/invitations', require('./routes/invitations'));
+app.use('/api/platform', require('./routes/platform'));
 
 // Health check
 app.get('/health', (req, res) => {

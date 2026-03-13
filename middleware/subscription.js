@@ -1,10 +1,15 @@
 const {
   assertFeatureEnabled
 } = require('../utils/subscription');
+const { normalizeRole } = require('../utils/tenantConstants');
 
 const requireSubscriptionFeature = (featureKey) => {
   return async (req, res, next) => {
     try {
+      if (normalizeRole(req.user?.role) === 'platform_admin') {
+        return next();
+      }
+
       if (!req.organization) {
         return res.status(400).json({
           success: false,

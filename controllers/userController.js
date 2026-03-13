@@ -7,6 +7,7 @@ const {
   getPasswordResetByAdminEmail
 } = require('../utils/emailService');
 const {
+  PROJECTIONS,
   getUsers: queryUsers,
   getUserById: queryUserById,
   getUserCount,
@@ -439,11 +440,23 @@ const getRoleLabel = (role, language = 'en') => {
 // @access  Private (Platform Admin, Organization Admin, Supervisor)
 exports.getUsers = async (req, res) => {
   try {
-    const organization = await resolveUserManagementOrganization(req);
-    const { role, department, isActive, search, page = 1, limit = 50, sort = 'name' } = req.query;
+    const isSystemScope = isPlatformAdmin(req.user) && req.query.scope === 'system';
+    const organization = isSystemScope
+      ? null
+      : await resolveUserManagementOrganization(req);
+    const {
+      role,
+      department,
+      isActive,
+      passwordResetRequested,
+      search,
+      page = 1,
+      limit = 50,
+      sort = 'name'
+    } = req.query;
     const pagination = parsePagination(page, limit);
     const sortObject = parseSort(sort);
-    const query = buildTenantQuery(organization);
+    const query = isSystemScope ? {} : buildTenantQuery(organization);
     const requesterRole = normalizeRole(req.user.role);
 
     if (role) {
@@ -458,7 +471,11 @@ exports.getUsers = async (req, res) => {
       query.isActive = isActive === 'true';
     }
 
-    if (requesterRole === 'supervisor') {
+    if (passwordResetRequested !== undefined) {
+      query.passwordResetRequested = passwordResetRequested === 'true';
+    }
+
+    if (!isSystemScope && requesterRole === 'supervisor') {
       if (query.department && !hasDepartmentAccess(req.user, query.department)) {
         throw createHttpError(403, 'You do not have access to this department');
       }
@@ -479,16 +496,34 @@ exports.getUsers = async (req, res) => {
       }
       : query;
 
-    const [users, total] = search
-      ? await Promise.all([
+    let users;
+    let total;
+
+    if (isSystemScope) {
+      [users, total] = await Promise.all([
+        User.find(totalQuery)
+          .select(PROJECTIONS.LIST)
+          .populate({
+            path: 'organizationId',
+            select: 'name slug branding.displayName departments'
+          })
+          .sort(sortObject)
+          .limit(pagination.limit)
+          .skip(pagination.skip)
+          .lean(),
+        User.countDocuments(totalQuery)
+      ]);
+    } else if (search) {
+      [users, total] = await Promise.all([
         querySearchUsers(search, query, 'LIST', {
           limit: pagination.limit,
           skip: pagination.skip,
           sort: sortObject
         }),
         getUserCount(totalQuery)
-      ])
-      : await Promise.all([
+      ]);
+    } else {
+      [users, total] = await Promise.all([
         queryUsers(query, 'LIST', {
           sort: sortObject,
           limit: pagination.limit,
@@ -496,6 +531,7 @@ exports.getUsers = async (req, res) => {
         }),
         getUserCount(query)
       ]);
+    }
 
     res.json({
       success: true,
@@ -902,7 +938,6 @@ exports.deleteUser = async (req, res) => {
 // @access  Private (Platform Admin, Organization Admin)
 exports.resetPassword = async (req, res) => {
   try {
-    const organization = await resolveUserManagementOrganization(req);
     const { newPassword } = req.body;
 
     if (!newPassword) {
@@ -920,6 +955,24 @@ exports.resetPassword = async (req, res) => {
         success: false,
         message: 'User not found'
       });
+    }
+
+    let organization = null;
+
+    if (isPlatformAdmin(req.user)) {
+      const requestedOrganizationId = getRequestedOrganizationId(req) || user.organizationId || null;
+      organization = requestedOrganizationId
+        ? await resolveManagedOrganization(req, requestedOrganizationId)
+        : null;
+
+      if (requestedOrganizationId && !organization) {
+        return res.status(404).json({
+          success: false,
+          message: 'Organization not found'
+        });
+      }
+    } else {
+      organization = await resolveUserManagementOrganization(req);
     }
 
     ensureUserAccess(req, user, organization);
@@ -945,7 +998,7 @@ exports.resetPassword = async (req, res) => {
 
     await createAuditLog({
       req,
-      organizationId: organization._id,
+      organizationId: organization?._id || user.organizationId || null,
       actorUserId: req.user._id,
       action: 'user.password_reset_by_admin',
       entityType: 'user',

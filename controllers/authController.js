@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const OrganizationRegistrationVerification = require('../models/OrganizationRegistrationVerification');
+const PlatformConfig = require('../models/PlatformConfig');
 const {
   generateAccessToken,
   generateRefreshToken,
@@ -22,6 +23,7 @@ const {
   toLegacyRole
 } = require('../utils/tenantConstants');
 const { assertUserSeatAvailable } = require('../utils/subscription');
+const { DEFAULT_PLATFORM_PROFILE } = require('../utils/platformDefaults');
 
 const ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES = 10;
 const ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH = 6;
@@ -129,33 +131,49 @@ const resolveOrganizationForUser = async (user) => {
   return findSingleActiveOrganization();
 };
 
-const buildOrganizationRegistrationPayload = async ({ organizationName, organizationSlug, email }) => ({
-  name: organizationName,
-  slug: await resolveAvailableOrganizationSlug(organizationName, organizationSlug),
-  status: 'active',
-  plan: 'free',
-  subscription: {
-    planCode: 'free',
+const getPlatformRegistrationProfile = async () => {
+  const config = await PlatformConfig.findOne({ key: 'global' })
+    .select('profile')
+    .lean();
+
+  return {
+    ...DEFAULT_PLATFORM_PROFILE,
+    ...(config?.profile || {})
+  };
+};
+
+const buildOrganizationRegistrationPayload = async ({ organizationName, organizationSlug, email }) => {
+  const platformProfile = await getPlatformRegistrationProfile();
+  const defaultPlanCode = platformProfile.defaultOrganizationPlan || 'free';
+
+  return {
+    name: organizationName,
+    slug: await resolveAvailableOrganizationSlug(organizationName, organizationSlug),
     status: 'active',
-    billingCycle: 'monthly',
-    startsAt: new Date(),
-    downgradePlanCode: 'free',
-    market: {
-      primaryRegion: 'MENA',
-      primaryCountry: 'SA',
-      currency: 'SAR'
+    plan: defaultPlanCode,
+    subscription: {
+      planCode: defaultPlanCode,
+      status: 'active',
+      billingCycle: 'monthly',
+      startsAt: new Date(),
+      downgradePlanCode: 'free',
+      market: {
+        primaryRegion: 'MENA',
+        primaryCountry: 'SA',
+        currency: 'SAR'
+      }
+    },
+    locale: platformProfile.locale || 'en',
+    timezone: platformProfile.timezone || 'Africa/Cairo',
+    branding: {
+      displayName: organizationName,
+      shortName: organizationName,
+      legalName: organizationName,
+      supportEmail: normalizeEmail(email),
+      emailFromName: organizationName
     }
-  },
-  locale: 'en',
-  timezone: 'Africa/Cairo',
-  branding: {
-    displayName: organizationName,
-    shortName: organizationName,
-    legalName: organizationName,
-    supportEmail: normalizeEmail(email),
-    emailFromName: organizationName
-  }
-});
+  };
+};
 
 const claimOrganizationRegistrationVerification = async (email, verificationToken) => (
   OrganizationRegistrationVerification.findOneAndUpdate(
@@ -539,6 +557,14 @@ exports.register = async (req, res) => {
 // @access  Public
 exports.sendOrganizationRegistrationVerificationCode = async (req, res) => {
   try {
+    const platformProfile = await getPlatformRegistrationProfile();
+    if (platformProfile.allowOrganizationRegistration === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Organization registration is currently disabled'
+      });
+    }
+
     const {
       email,
       organizationName,
@@ -665,6 +691,14 @@ exports.verifyOrganizationRegistrationEmail = async (req, res) => {
 // @access  Public
 exports.registerOrganization = async (req, res) => {
   try {
+    const platformProfile = await getPlatformRegistrationProfile();
+    if (platformProfile.allowOrganizationRegistration === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Organization registration is currently disabled'
+      });
+    }
+
     const {
       organizationName,
       organizationSlug,

@@ -1,13 +1,13 @@
 const mongoose = require('mongoose');
 const {
   LEGACY_DEPARTMENTS,
-  ORGANIZATION_PLAN_VALUES,
   ORGANIZATION_STATUS_VALUES,
   isValidDepartmentCode,
   isValidSlug,
   normalizeDepartmentCode,
   normalizeDomain,
-  normalizeOrganizationPlan
+  normalizeOrganizationPlan,
+  slugPattern
 } = require('../utils/tenantConstants');
 
 const titleizeDepartment = (value) => value
@@ -89,8 +89,14 @@ const organizationSchema = new mongoose.Schema({
   },
   plan: {
     type: String,
-    enum: ORGANIZATION_PLAN_VALUES,
-    default: 'free'
+    default: 'free',
+    trim: true,
+    lowercase: true,
+    set: normalizeOrganizationPlan,
+    validate: {
+      validator: (value) => !value || slugPattern.test(value),
+      message: 'Organization plan must use lowercase letters, numbers, and hyphens only'
+    }
   },
   subscription: {
     planCode: {
