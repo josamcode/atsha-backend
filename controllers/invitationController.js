@@ -16,17 +16,24 @@ const {
   generateAccessToken,
   generateRefreshToken
 } = require('../utils/tokenUtils');
+const { formatOrganizationForClient } = require('../utils/organizationFormatter');
+const { assertUserSeatAvailable } = require('../utils/subscription');
 
-const formatOrganization = (organization) => ({
-  id: organization._id,
-  name: organization.name,
-  slug: organization.slug,
-  status: organization.status,
-  locale: organization.locale,
-  timezone: organization.timezone,
-  branding: organization.branding || {},
-  featureFlags: organization.featureFlags || {}
-});
+const formatOrganization = async (organization) => {
+  const formattedOrganization = await formatOrganizationForClient(organization);
+
+  return {
+    id: formattedOrganization.id,
+    name: formattedOrganization.name,
+    slug: formattedOrganization.slug,
+    status: formattedOrganization.status,
+    locale: formattedOrganization.locale,
+    timezone: formattedOrganization.timezone,
+    branding: formattedOrganization.branding || {},
+    featureFlags: formattedOrganization.featureFlags || {},
+    subscription: formattedOrganization.subscription
+  };
+};
 
 const formatInvitation = (invitation, options = {}) => {
   const source = invitation.toObject ? invitation.toObject() : invitation;
@@ -216,6 +223,8 @@ exports.createInvitation = async (req, res) => {
     const canonicalRole = normalizeRole(role);
     const departmentInfo = parseDepartments(organization, req.body);
 
+    await assertUserSeatAvailable(organization);
+
     await Invitation.updateMany(
       {
         organizationId: organization._id,
@@ -346,7 +355,7 @@ exports.getInvitationPreview = async (req, res) => {
       success: true,
       data: {
         invitation: formatInvitation(invitation),
-        organization: formatOrganization(organization)
+        organization: await formatOrganization(organization)
       }
     });
   } catch (error) {
@@ -411,6 +420,8 @@ exports.acceptInvitation = async (req, res) => {
       });
     }
 
+    await assertUserSeatAvailable(organization);
+
     const user = await User.create({
       organizationId: organization._id,
       name,
@@ -454,7 +465,7 @@ exports.acceptInvitation = async (req, res) => {
       success: true,
       data: {
         user: formatUser(user),
-        organization: formatOrganization(organization),
+        organization: await formatOrganization(organization),
         accessToken,
         refreshToken
       }

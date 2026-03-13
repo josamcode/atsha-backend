@@ -12,8 +12,10 @@ const {
   getMyLeaveBalance
 } = require('../controllers/leaveController');
 const { protect, authorize } = require('../middleware/auth');
+const { requireSubscriptionFeature } = require('../middleware/subscription');
 
 router.use(protect);
+router.use(requireSubscriptionFeature('leaveManagement'));
 
 router.get('/my-balance', getMyLeaveBalance);
 router.get('/stats/summary', authorize('platform_admin', 'admin', 'supervisor'), getLeaveStats);

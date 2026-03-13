@@ -31,6 +31,7 @@ const {
   normalizeRole,
   toLegacyRole
 } = require('../utils/tenantConstants');
+const { assertUserSeatAvailable } = require('../utils/subscription');
 
 const MANAGED_ROLE_VALUES = new Set([
   'platform_admin',
@@ -597,6 +598,8 @@ exports.createUser = async (req, res) => {
         message: 'User already exists with this email in this organization'
       });
     }
+
+    await assertUserSeatAvailable(organization);
 
     if (req.file) {
       const uploadedImage = await uploadUserImage(req.file);

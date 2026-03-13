@@ -23,6 +23,11 @@ const {
   templateSupportsDepartment
 } = require('../utils/formAccess');
 const {
+  assertFormCreationAvailable,
+  assertTemplateUnlocked,
+  incrementMonthlyUsage
+} = require('../utils/subscription');
+const {
   normalizeDepartmentCode,
   normalizeRole
 } = require('../utils/tenantConstants');
@@ -559,6 +564,8 @@ exports.createFormInstance = async (req, res) => {
 
     const template = await getTemplateById(templateId, organization._id);
     ensureTemplateAvailability(req, template);
+    await assertTemplateUnlocked(organization, template);
+    await assertFormCreationAvailable(organization);
     const submittedValues = ensureValuesObject(values) || {};
     const imageFieldKeys = getImageFieldKeys(template.sections || []);
     const instanceId = new mongoose.Types.ObjectId();
@@ -630,6 +637,12 @@ exports.createFormInstance = async (req, res) => {
       });
     }
 
+    await incrementMonthlyUsage({
+      organizationId: organization._id,
+      metric: 'formsPerMonth',
+      amount: 1
+    });
+
     res.status(201).json({
       success: true,
       data: instance
@@ -671,6 +684,8 @@ exports.updateFormInstance = async (req, res) => {
     if (!template) {
       throw createHttpError(404, 'Form template not found');
     }
+
+    await assertTemplateUnlocked(organization, template);
 
     if (!template.isActive) {
       throw createHttpError(400, 'Form template is not active');

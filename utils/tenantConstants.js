@@ -27,7 +27,14 @@ const FORM_VISIBILITY_ROLE_VALUES = [
 ];
 
 const ORGANIZATION_STATUS_VALUES = ['active', 'inactive', 'suspended'];
-const ORGANIZATION_PLAN_VALUES = ['standard', 'enterprise', 'internal'];
+const ORGANIZATION_PLAN_VALUES = [
+  'free',
+  'starter',
+  'growth',
+  'standard',
+  'enterprise',
+  'internal'
+];
 
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const departmentCodePattern = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;

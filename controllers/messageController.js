@@ -5,6 +5,10 @@ const {
   createHttpError,
   resolveScopedOrganization
 } = require('../utils/formAccess');
+const {
+  assertMessageSendAvailable,
+  incrementMonthlyUsage
+} = require('../utils/subscription');
 const { normalizeRole } = require('../utils/tenantConstants');
 
 const MESSAGE_POPULATE = [
@@ -280,6 +284,8 @@ exports.sendMessage = async (req, res) => {
         throw createHttpError(400, 'One or more recipients are invalid for this organization');
       }
 
+      await assertMessageSendAvailable(organization, recipientUsers.length);
+
       const messages = recipientUsers.map((recipientUser) => (
         attachOrganizationId({
           sender: req.user.id,
@@ -293,6 +299,11 @@ exports.sendMessage = async (req, res) => {
 
       const createdMessages = await Message.insertMany(messages);
       await Message.populate(createdMessages, MESSAGE_POPULATE);
+      await incrementMonthlyUsage({
+        organizationId: organization._id,
+        metric: 'messagesPerMonth',
+        amount: createdMessages.length
+      });
 
       return res.status(201).json({
         success: true,
@@ -307,6 +318,8 @@ exports.sendMessage = async (req, res) => {
         message: 'Recipient is required'
       });
     }
+
+    await assertMessageSendAvailable(organization, 1);
 
     const recipientUser = await getOrganizationUserOrThrow(organization._id, recipient);
 
@@ -325,6 +338,11 @@ exports.sendMessage = async (req, res) => {
     }, organization));
 
     await message.populate(MESSAGE_POPULATE);
+    await incrementMonthlyUsage({
+      organizationId: organization._id,
+      metric: 'messagesPerMonth',
+      amount: 1
+    });
 
     res.status(201).json({
       success: true,

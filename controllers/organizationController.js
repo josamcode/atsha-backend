@@ -4,6 +4,7 @@ const Invitation = require('../models/Invitation');
 const { createAuditLog } = require('../utils/auditLogger');
 const { deleteStoredAsset, uploadOrganizationBrandingAsset } = require('../utils/mediaStorage');
 const { resolveManagedOrganization } = require('../utils/organizationAccess');
+const { formatOrganizationForClient } = require('../utils/organizationFormatter');
 const {
   normalizeDepartmentCode,
   normalizeDomain
@@ -20,14 +21,8 @@ const titleizeDepartment = (value) => value
   .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
   .join(' ');
 
-const formatOrganization = (organization, summary = null) => {
-  const source = organization.toObject ? organization.toObject() : organization;
-
-  return {
-    ...source,
-    id: source._id,
-    ...(summary ? { summary } : {})
-  };
+const formatOrganization = async (organization, options = {}) => {
+  return formatOrganizationForClient(organization, options);
 };
 
 const parseAllowedDomains = (domains) => {
@@ -121,6 +116,37 @@ const sanitizeBrandingPatch = (branding) => {
   return Object.keys(allowedBrandingFields).length > 0 ? allowedBrandingFields : undefined;
 };
 
+const parseDateValue = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsedValue = new Date(value);
+  return Number.isNaN(parsedValue.getTime()) ? null : parsedValue;
+};
+
+const sanitizeSubscriptionPatch = (subscription) => {
+  if (!subscription || typeof subscription !== 'object') {
+    return undefined;
+  }
+
+  const patch = {};
+
+  if (subscription.planCode !== undefined) patch.planCode = subscription.planCode;
+  if (subscription.status !== undefined) patch.status = subscription.status;
+  if (subscription.billingCycle !== undefined) patch.billingCycle = subscription.billingCycle;
+  if (subscription.startsAt !== undefined) patch.startsAt = parseDateValue(subscription.startsAt);
+  if (subscription.endsAt !== undefined) patch.endsAt = parseDateValue(subscription.endsAt);
+  if (subscription.graceEndsAt !== undefined) patch.graceEndsAt = parseDateValue(subscription.graceEndsAt);
+  if (subscription.downgradePlanCode !== undefined) patch.downgradePlanCode = subscription.downgradePlanCode;
+  if (subscription.market && typeof subscription.market === 'object') patch.market = subscription.market;
+  if (subscription.customLimits && typeof subscription.customLimits === 'object') patch.customLimits = subscription.customLimits;
+  if (subscription.customFeatures && typeof subscription.customFeatures === 'object') patch.customFeatures = subscription.customFeatures;
+  if (subscription.notes !== undefined) patch.notes = subscription.notes;
+
+  return Object.keys(patch).length > 0 ? patch : undefined;
+};
+
 const sendControllerError = (res, error) => {
   if (error.code === 11000) {
     return res.status(400).json({
@@ -178,6 +204,13 @@ const buildPlatformOrganizationPatch = (body) => {
   if (body.attendanceSettings) patch.attendanceSettings = body.attendanceSettings;
   if (body.leaveSettings) patch.leaveSettings = body.leaveSettings;
   if (body.featureFlags) patch.featureFlags = body.featureFlags;
+  if (body.subscription) patch.subscription = sanitizeSubscriptionPatch(body.subscription);
+
+  if (patch.plan !== undefined && !patch.subscription) {
+    patch.subscription = {
+      planCode: patch.plan
+    };
+  }
 
   return patch;
 };
@@ -220,7 +253,10 @@ exports.getCurrentOrganization = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization, summary)
+      data: await formatOrganization(organization, {
+        includeUsage: true,
+        summary
+      })
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -285,7 +321,9 @@ exports.updateCurrentOrganizationSettings = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization)
+      data: await formatOrganization(organization, {
+        includeUsage: true
+      })
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -368,7 +406,9 @@ exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization),
+      data: await formatOrganization(organization, {
+        includeUsage: true
+      }),
       assetType,
       url: uploadedAssetUrl
     });
@@ -394,7 +434,11 @@ exports.listOrganizations = async (req, res) => {
     const query = {};
 
     if (status) query.status = status;
-    if (plan) query.plan = plan;
+    if (plan) {
+      query.plan = plan === 'growth'
+        ? { $in: ['growth', 'standard'] }
+        : plan;
+    }
     if (search) {
       query.$or = [
         { name: { $regex: search, $options: 'i' } },
@@ -416,7 +460,9 @@ exports.listOrganizations = async (req, res) => {
       success: true,
       count: organizations.length,
       total,
-      data: organizations.map((organization) => formatOrganization(organization))
+      data: await Promise.all(
+        organizations.map((organization) => formatOrganization(organization))
+      )
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -441,7 +487,10 @@ exports.getOrganizationById = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization, summary)
+      data: await formatOrganization(organization, {
+        includeUsage: true,
+        summary
+      })
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -485,7 +534,9 @@ exports.createOrganization = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      data: formatOrganization(organization)
+      data: await formatOrganization(organization, {
+        includeUsage: true
+      })
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -511,7 +562,8 @@ exports.updateOrganization = async (req, res) => {
       name: organization.name,
       slug: organization.slug,
       status: organization.status,
-      plan: organization.plan
+      plan: organization.plan,
+      subscription: organization.subscription
     };
 
     if (patch.name !== undefined) organization.name = patch.name;
@@ -527,6 +579,12 @@ exports.updateOrganization = async (req, res) => {
     if (patch.attendanceSettings) organization.attendanceSettings = mergeObject(organization.attendanceSettings, patch.attendanceSettings);
     if (patch.leaveSettings) organization.leaveSettings = mergeObject(organization.leaveSettings, patch.leaveSettings);
     if (patch.featureFlags) organization.featureFlags = mergeObject(organization.featureFlags, patch.featureFlags);
+    if (patch.subscription) {
+      organization.subscription = mergeObject(organization.subscription, patch.subscription);
+      if (patch.subscription.planCode) {
+        organization.plan = patch.subscription.planCode;
+      }
+    }
 
     await organization.save();
 
@@ -546,7 +604,9 @@ exports.updateOrganization = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization)
+      data: await formatOrganization(organization, {
+        includeUsage: true
+      })
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -595,7 +655,9 @@ exports.updateOrganizationStatus = async (req, res) => {
 
     res.json({
       success: true,
-      data: formatOrganization(organization)
+      data: await formatOrganization(organization, {
+        includeUsage: true
+      })
     });
   } catch (error) {
     sendControllerError(res, error);

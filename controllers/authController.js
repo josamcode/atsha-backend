@@ -15,11 +15,13 @@ const {
   getOrganizationRegistrationVerificationEmail,
   sendEmailToAdmins
 } = require('../utils/emailService');
+const { formatOrganizationForClient } = require('../utils/organizationFormatter');
 const {
   LEGACY_DEPARTMENTS,
   normalizeRole,
   toLegacyRole
 } = require('../utils/tenantConstants');
+const { assertUserSeatAvailable } = require('../utils/subscription');
 
 const ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES = 10;
 const ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH = 6;
@@ -131,7 +133,19 @@ const buildOrganizationRegistrationPayload = async ({ organizationName, organiza
   name: organizationName,
   slug: await resolveAvailableOrganizationSlug(organizationName, organizationSlug),
   status: 'active',
-  plan: 'standard',
+  plan: 'growth',
+  subscription: {
+    planCode: 'growth',
+    status: 'active',
+    billingCycle: 'monthly',
+    startsAt: new Date(),
+    downgradePlanCode: 'free',
+    market: {
+      primaryRegion: 'MENA',
+      primaryCountry: 'SA',
+      currency: 'SAR'
+    }
+  },
   locale: 'en',
   timezone: 'Africa/Cairo',
   branding: {
@@ -334,21 +348,23 @@ const buildScopedUserQuery = (userId, organizationId) => {
   };
 };
 
-const formatOrganization = (organization) => {
+const formatOrganization = async (organization, options = {}) => {
   if (!organization) {
     return null;
   }
 
+  const formattedOrganization = await formatOrganizationForClient(organization, options);
   return {
-    id: organization._id,
-    name: organization.name,
-    slug: organization.slug,
-    status: organization.status,
-    locale: organization.locale,
-    timezone: organization.timezone,
-    branding: organization.branding || {},
-    featureFlags: organization.featureFlags || {},
-    departments: getOrganizationDepartments(organization)
+    id: formattedOrganization.id,
+    name: formattedOrganization.name,
+    slug: formattedOrganization.slug,
+    status: formattedOrganization.status,
+    locale: formattedOrganization.locale,
+    timezone: formattedOrganization.timezone,
+    branding: formattedOrganization.branding || {},
+    featureFlags: formattedOrganization.featureFlags || {},
+    departments: getOrganizationDepartments(formattedOrganization),
+    subscription: formattedOrganization.subscription
   };
 };
 
@@ -405,11 +421,11 @@ const ensureUserBelongsToOrganization = (user, organization, res) => {
   return true;
 };
 
-const buildAuthResponse = (user, organization, tokens = {}) => ({
+const buildAuthResponse = async (user, organization, tokens = {}) => ({
   success: true,
   data: {
     user: formatUser(user),
-    organization: formatOrganization(organization),
+    organization: await formatOrganization(organization),
     ...tokens
   }
 });
@@ -442,12 +458,12 @@ exports.getOrganizationContext = async (req, res) => {
     return;
   }
 
-  res.json({
-    success: true,
-    data: {
-      organization: formatOrganization(organization)
-    }
-  });
+    res.json({
+      success: true,
+      data: {
+        organization: await formatOrganization(organization)
+      }
+    });
 };
 
 // @desc    Register user
@@ -482,6 +498,8 @@ exports.register = async (req, res) => {
       });
     }
 
+    await assertUserSeatAvailable(organization);
+
     const user = await User.create({
       organizationId: organization._id,
       name,
@@ -504,7 +522,7 @@ exports.register = async (req, res) => {
 
     user.refreshToken = refreshToken;
 
-    res.status(201).json(buildAuthResponse(user, organization, {
+    res.status(201).json(await buildAuthResponse(user, organization, {
       accessToken,
       refreshToken
     }));
@@ -727,7 +745,7 @@ exports.registerOrganization = async (req, res) => {
 
       user.refreshToken = refreshToken;
 
-      res.status(201).json(buildAuthResponse(user, organization, {
+      res.status(201).json(await buildAuthResponse(user, organization, {
         accessToken,
         refreshToken
       }));
@@ -853,7 +871,7 @@ exports.login = async (req, res) => {
 
     user.refreshToken = refreshToken;
 
-    res.json(buildAuthResponse(user, organization, {
+    res.json(await buildAuthResponse(user, organization, {
       accessToken,
       refreshToken
     }));
@@ -962,12 +980,12 @@ exports.refreshToken = async (req, res) => {
     const accessToken = generateAccessToken(user, organization);
 
     res.json({
-      success: true,
-      data: {
-        accessToken,
-        organization: formatOrganization(organization)
-      }
-    });
+        success: true,
+        data: {
+          accessToken,
+          organization: await formatOrganization(organization)
+        }
+      });
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -1007,7 +1025,7 @@ exports.getMe = async (req, res) => {
       buildScopedUserQuery(req.user.id, req.organization?._id)
     );
 
-    res.json(buildAuthResponse(user || req.user, req.organization));
+    res.json(await buildAuthResponse(user || req.user, req.organization));
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -1040,7 +1058,7 @@ exports.updateProfile = async (req, res) => {
 
     await user.save();
 
-    res.json(buildAuthResponse(user, req.organization));
+    res.json(await buildAuthResponse(user, req.organization));
   } catch (error) {
     res.status(500).json({
       success: false,

@@ -13,9 +13,11 @@ const {
   deleteAllMessages
 } = require('../controllers/messageController');
 const { protect } = require('../middleware/auth');
+const { requireSubscriptionFeature } = require('../middleware/subscription');
 
 // All routes require authentication
 router.use(protect);
+router.use(requireSubscriptionFeature('messaging'));
 
 router.route('/')
   .get(getMessages)

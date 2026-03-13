@@ -11,6 +11,11 @@ const {
   roleListIncludes,
   templateSupportsDepartment
 } = require('../utils/formAccess');
+const {
+  annotateTemplatesWithSubscriptionAccess,
+  assertTemplateCreationAvailable,
+  assertTemplateUnlocked
+} = require('../utils/subscription');
 const { normalizeDepartmentCode, normalizeRole } = require('../utils/tenantConstants');
 
 const DEFAULT_TEMPLATE_VISIBLE_ROLES = ['admin', 'supervisor', 'employee'];
@@ -120,11 +125,15 @@ exports.getFormTemplates = async (req, res) => {
     const templates = await FormTemplate.find(query)
       .populate('createdBy', 'name email department role')
       .sort({ createdAt: -1 });
+    const templatesWithAccess = await annotateTemplatesWithSubscriptionAccess(
+      organization,
+      templates
+    );
 
     res.json({
       success: true,
-      count: templates.length,
-      data: templates
+      count: templatesWithAccess.length,
+      data: templatesWithAccess
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -145,12 +154,16 @@ exports.getFormTemplate = async (req, res) => {
       });
     }
 
-    await resolveFormsOrganization(req, template.organizationId);
+    const organization = await resolveFormsOrganization(req, template.organizationId);
     ensureTemplateReadAccess(req, template);
+    const [formattedTemplate] = await annotateTemplatesWithSubscriptionAccess(
+      organization,
+      [template]
+    );
 
     res.json({
       success: true,
-      data: template
+      data: formattedTemplate
     });
   } catch (error) {
     sendControllerError(res, error);
@@ -174,6 +187,8 @@ exports.createFormTemplate = async (req, res) => {
       layout,
       pdfStyle
     } = req.body;
+
+    await assertTemplateCreationAvailable(organization);
 
     const template = await FormTemplate.create(attachOrganizationId({
       title,
@@ -238,6 +253,7 @@ exports.updateFormTemplate = async (req, res) => {
     }
 
     const organization = await resolveFormsOrganization(req, template.organizationId);
+    await assertTemplateUnlocked(organization, template);
     const {
       title,
       description,
@@ -362,6 +378,7 @@ exports.duplicateFormTemplate = async (req, res) => {
     }
 
     const organization = await resolveFormsOrganization(req, originalTemplate.organizationId);
+    await assertTemplateCreationAvailable(organization);
     const duplicate = await FormTemplate.create(attachOrganizationId({
       title: {
         en: `${originalTemplate.title?.en || 'Template'} (Copy)`,

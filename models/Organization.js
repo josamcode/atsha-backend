@@ -89,7 +89,63 @@ const organizationSchema = new mongoose.Schema({
   plan: {
     type: String,
     enum: ORGANIZATION_PLAN_VALUES,
-    default: 'standard'
+    default: 'growth'
+  },
+  subscription: {
+    planCode: {
+      type: String,
+      trim: true,
+      lowercase: true
+    },
+    status: {
+      type: String,
+      enum: ['trialing', 'active', 'past_due', 'expired', 'cancelled', 'suspended'],
+      default: 'active'
+    },
+    billingCycle: {
+      type: String,
+      enum: ['monthly', 'quarterly', 'semiannual', 'annual', 'custom'],
+      default: 'monthly'
+    },
+    startsAt: Date,
+    endsAt: Date,
+    graceEndsAt: Date,
+    downgradePlanCode: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      default: 'free'
+    },
+    market: {
+      primaryRegion: {
+        type: String,
+        default: 'MENA'
+      },
+      primaryCountry: {
+        type: String,
+        default: 'SA'
+      },
+      currency: {
+        type: String,
+        default: 'SAR'
+      }
+    },
+    customLimits: {
+      formsPerMonth: Number,
+      templatesTotal: Number,
+      usersTotal: Number,
+      messagesPerMonth: Number
+    },
+    customFeatures: {
+      qrCode: Boolean,
+      attendanceManagement: Boolean,
+      leaveManagement: Boolean,
+      messaging: Boolean
+    },
+    notes: {
+      type: String,
+      trim: true
+    }
   },
   branding: {
     displayName: {
@@ -204,6 +260,22 @@ const organizationSchema = new mongoose.Schema({
     customBranding: {
       type: Boolean,
       default: true
+    },
+    qrCode: {
+      type: Boolean,
+      default: true
+    },
+    attendanceManagement: {
+      type: Boolean,
+      default: true
+    },
+    leaveManagement: {
+      type: Boolean,
+      default: true
+    },
+    messaging: {
+      type: Boolean,
+      default: true
     }
   },
   createdBy: {
@@ -233,6 +305,18 @@ organizationSchema.pre('validate', function (next) {
 
   if (!Array.isArray(this.departments) || this.departments.length === 0) {
     this.departments = buildDefaultDepartments();
+  }
+
+  if (!this.subscription || typeof this.subscription !== 'object') {
+    this.subscription = {};
+  }
+
+  if (!this.subscription.planCode && this.plan) {
+    this.subscription.planCode = this.plan;
+  }
+
+  if (this.subscription.planCode) {
+    this.plan = this.subscription.planCode;
   }
 
   next();
