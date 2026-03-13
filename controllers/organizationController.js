@@ -468,7 +468,9 @@ exports.listOrganizations = async (req, res) => {
       count: organizations.length,
       total,
       data: await Promise.all(
-        organizations.map((organization) => formatOrganization(organization))
+        organizations.map(async (organization) => formatOrganization(organization, {
+          summary: await getOrganizationSummary(organization._id)
+        }))
       )
     });
   } catch (error) {

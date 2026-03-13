@@ -17,6 +17,7 @@ const {
   createHttpError,
   ensureDepartmentAccess,
   getActiveDepartmentCodes,
+  getRequestedOrganizationId,
   getUserManagedDepartments,
   resolveFormsOrganization,
   roleListIncludes,
@@ -52,6 +53,10 @@ const FORM_INSTANCE_TEMPLATE_DETAIL_SELECT = [
 
 const FORM_INSTANCE_POPULATE_SUMMARY = [
   {
+    path: 'organizationId',
+    select: 'name slug departments branding.displayName'
+  },
+  {
     path: 'templateId',
     select: FORM_INSTANCE_TEMPLATE_SUMMARY_SELECT
   },
@@ -66,6 +71,10 @@ const FORM_INSTANCE_POPULATE_SUMMARY = [
 ];
 
 const FORM_INSTANCE_POPULATE_DETAIL = [
+  {
+    path: 'organizationId',
+    select: 'name slug departments branding.displayName'
+  },
   {
     path: 'templateId',
     select: FORM_INSTANCE_TEMPLATE_DETAIL_SELECT
@@ -465,12 +474,18 @@ const sendDecisionNotifications = async (instance, organization, status, notes) 
 // @access  Private
 exports.getFormInstances = async (req, res) => {
   try {
-    const organization = await resolveFormsOrganization(req);
-    const { templateId, status, department, dateFrom, dateTo, filledBy } = req.query;
-    const query = {
-      organizationId: organization._id
-    };
     const normalizedRole = normalizeRole(req.user.role);
+    const requestedOrganizationId = getRequestedOrganizationId(req);
+    const isPlatformAdminGlobalScope = normalizedRole === 'platform_admin' && !requestedOrganizationId;
+    const organization = isPlatformAdminGlobalScope
+      ? null
+      : await resolveFormsOrganization(req);
+    const { templateId, status, department, dateFrom, dateTo, filledBy } = req.query;
+    const query = {};
+
+    if (organization?._id) {
+      query.organizationId = organization._id;
+    }
 
     if (templateId) query.templateId = templateId;
     if (status) query.status = status;

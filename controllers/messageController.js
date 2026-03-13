@@ -13,6 +13,10 @@ const { normalizeRole } = require('../utils/tenantConstants');
 
 const MESSAGE_POPULATE = [
   {
+    path: 'organizationId',
+    select: 'name slug branding.displayName'
+  },
+  {
     path: 'sender',
     select: 'organizationId name email department role'
   },
@@ -80,9 +84,13 @@ const ensureMessageOwnership = (message, userId) => {
 exports.getMessages = async (req, res) => {
   try {
     const organization = await resolveMessageOrganization(req);
-    const { read, limit = 50, page = 1 } = req.query;
+    const normalizedRole = normalizeRole(req.user.role);
+    const { read, limit = 50, page = 1, scope } = req.query;
     const pagination = parsePagination(page, limit);
-    const query = buildTenantQuery(organization, { recipient: req.user.id });
+    const isPlatformAdminSystemScope = normalizedRole === 'platform_admin' && scope === 'system';
+    const query = isPlatformAdminSystemScope
+      ? {}
+      : buildTenantQuery(organization, { recipient: req.user.id });
 
     if (read !== undefined) {
       query.read = read === 'true';
@@ -95,15 +103,20 @@ exports.getMessages = async (req, res) => {
         .skip(pagination.skip)
         .populate(MESSAGE_POPULATE),
       Message.countDocuments(query),
-      Message.countDocuments(buildTenantQuery(organization, {
-        recipient: req.user.id,
-        read: false
-      }))
+      Message.countDocuments(
+        isPlatformAdminSystemScope
+          ? { read: false }
+          : buildTenantQuery(organization, {
+            recipient: req.user.id,
+            read: false
+          })
+      )
     ]);
 
     res.json({
       success: true,
       data: messages,
+      scope: isPlatformAdminSystemScope ? 'system' : 'personal',
       pagination: {
         total,
         page: pagination.page,

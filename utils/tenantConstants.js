@@ -16,7 +16,7 @@ const USER_ROLE_VALUES = [
   'supervisor',
   'employee',
   'qr_manager',
-  'qr-manager'
+   'qr-manager'
 ];
 
 const FORM_VISIBILITY_ROLE_VALUES = [

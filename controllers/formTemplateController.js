@@ -3,6 +3,7 @@ const { createAuditLog } = require('../utils/auditLogger');
 const { attachOrganizationId } = require('../utils/tenantScope');
 const {
   createHttpError,
+  getRequestedOrganizationId,
   getRoleVariants,
   getUserManagedDepartments,
   normalizeTemplateDepartments,
@@ -88,12 +89,18 @@ const ensureTemplateReadAccess = (req, template) => {
 // @access  Private
 exports.getFormTemplates = async (req, res) => {
   try {
-    const organization = await resolveFormsOrganization(req);
-    const { isActive, department } = req.query;
-    const query = {
-      organizationId: organization._id
-    };
     const normalizedRole = normalizeRole(req.user.role);
+    const requestedOrganizationId = getRequestedOrganizationId(req);
+    const isPlatformAdminGlobalScope = normalizedRole === 'platform_admin' && !requestedOrganizationId;
+    const organization = isPlatformAdminGlobalScope
+      ? null
+      : await resolveFormsOrganization(req);
+    const { isActive, department } = req.query;
+    const query = {};
+
+    if (organization?._id) {
+      query.organizationId = organization._id;
+    }
 
     if (isActive !== undefined) {
       query.isActive = isActive === 'true';
@@ -123,8 +130,18 @@ exports.getFormTemplates = async (req, res) => {
     }
 
     const templates = await FormTemplate.find(query)
+      .populate('organizationId', 'name slug departments branding.displayName')
       .populate('createdBy', 'name email department role')
       .sort({ createdAt: -1 });
+
+    if (isPlatformAdminGlobalScope) {
+      return res.json({
+        success: true,
+        count: templates.length,
+        data: templates
+      });
+    }
+
     const templatesWithAccess = await annotateTemplatesWithSubscriptionAccess(
       organization,
       templates

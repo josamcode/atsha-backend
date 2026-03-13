@@ -2,8 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
 const FormInstance = require('../models/FormInstance');
+const FormTemplate = require('../models/FormTemplate');
 const LeaveRequest = require('../models/LeaveRequest');
 const AttendanceLog = require('../models/AttendanceLog');
+const Message = require('../models/Message');
+const Organization = require('../models/Organization');
 const User = require('../models/User');
 const cache = require('../utils/cache');
 const logger = require('../utils/logger');
@@ -27,7 +30,7 @@ router.get('/summary', protect, async (req, res) => {
     const normalizedRole = normalizeRole(req.user.role);
     const cacheKey = cache.key(
       'dashboard',
-      organization._id,
+      normalizedRole === 'platform_admin' ? 'system' : organization._id,
       normalizedRole,
       req.user.id
     );
@@ -47,6 +50,91 @@ router.get('/summary', protect, async (req, res) => {
     thisWeekStart.setDate(thisWeekStart.getDate() - thisWeekStart.getDay());
     const monthStart = new Date(todayStart);
     monthStart.setDate(1);
+    const upcomingWindowEnd = new Date(todayStart.getTime() + (7 * 24 * 60 * 60 * 1000));
+
+    if (normalizedRole === 'platform_admin') {
+      const [
+        totalOrganizations,
+        activeOrganizations,
+        totalUsers,
+        activeUsers,
+        totalTemplates,
+        activeTemplates,
+        totalMessages,
+        todayMessages,
+        totalForms,
+        todayForms,
+        pendingApprovals,
+        pendingLeaves,
+        upcomingLeaves,
+        recentForms
+      ] = await Promise.all([
+        Organization.countDocuments({}),
+        Organization.countDocuments({ status: 'active' }),
+        User.countDocuments({}),
+        User.countDocuments({ isActive: true }),
+        FormTemplate.countDocuments({}),
+        FormTemplate.countDocuments({ isActive: true }),
+        Message.countDocuments({}),
+        Message.countDocuments({
+          createdAt: { $gte: todayStart, $lte: todayEnd }
+        }),
+        FormInstance.countDocuments({}),
+        FormInstance.countDocuments({
+          date: { $gte: todayStart, $lte: todayEnd }
+        }),
+        FormInstance.countDocuments({ status: 'submitted' }),
+        LeaveRequest.countDocuments({ status: 'pending' }),
+        LeaveRequest.countDocuments({
+          status: 'approved',
+          startDate: { $gte: todayStart, $lte: upcomingWindowEnd }
+        }),
+        FormInstance.find({})
+          .populate('organizationId', 'name slug departments branding.displayName')
+          .populate('templateId', 'organizationId title')
+          .populate('filledBy', 'organizationId name department')
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .lean()
+      ]);
+
+      const data = {
+        scope: 'system',
+        organizations: {
+          total: totalOrganizations,
+          active: activeOrganizations
+        },
+        users: {
+          total: totalUsers,
+          active: activeUsers
+        },
+        templates: {
+          total: totalTemplates,
+          active: activeTemplates
+        },
+        messages: {
+          total: totalMessages,
+          today: todayMessages
+        },
+        forms: {
+          total: totalForms,
+          today: todayForms,
+          pendingApprovals
+        },
+        leaves: {
+          pending: pendingLeaves,
+          upcoming: upcomingLeaves
+        },
+        recentForms
+      };
+
+      await cache.set(cacheKey, data, cache.CACHE_TTL.SHORT);
+
+      return res.json({
+        success: true,
+        data
+      });
+    }
 
     if (EMPLOYEE_LIKE_ROLES.has(normalizedRole)) {
       const [
@@ -159,8 +247,6 @@ router.get('/summary', protect, async (req, res) => {
         };
       }
     }
-
-    const upcomingWindowEnd = new Date(todayStart.getTime() + (7 * 24 * 60 * 60 * 1000));
 
     const [
       todayForms,
