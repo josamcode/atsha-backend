@@ -673,6 +673,40 @@ const getPasswordResetEmail = (resetData, language = 'en') => {
   };
 };
 
+const getOrganizationRegistrationVerificationEmail = (verificationData, language = 'en') => {
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'تأكيد بريد المؤسسة' : 'Verify Your Organization Email';
+  const code = verificationData.code || '000000';
+  const organizationName = verificationData.organizationName || (isRTL ? 'مؤسستك' : 'your organization');
+  const expiresIn = verificationData.expiresIn || '10 minutes';
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL ? 'مرحباً،' : 'Hello,'}</p>
+    <p>${isRTL
+      ? `استخدم رمز التحقق التالي لتأكيد بريد ${organizationName} قبل إنشاء الحساب.`
+      : `Use the verification code below to confirm the email for ${organizationName} before creating the account.`}</p>
+    <div style="margin: 32px 0; text-align: center;">
+      <div style="display: inline-block; padding: 18px 28px; border-radius: 14px; border: 1px solid #d1fae5; background: linear-gradient(135deg, #ecfdf5, #f0fdf4); font-size: 32px; letter-spacing: 10px; font-weight: 700; color: #047857;">
+        ${code}
+      </div>
+    </div>
+    <p style="font-size: 14px; color: #10B981; font-weight: 500;">
+      ${isRTL ? `سينتهي هذا الرمز خلال ${expiresIn}.` : `This code expires in ${expiresIn}.`}
+    </p>
+    <p style="font-size: 14px; color: #6b7280;">
+      ${isRTL
+        ? 'إذا لم تطلب إنشاء مؤسسة جديدة، يمكنك تجاهل هذا البريد.'
+        : 'If you did not request a new organization account, you can ignore this email.'}
+    </p>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
 // Password reset request email (to admins)
 const getPasswordResetRequestEmail = (requestData, language = 'en') => {
   const isRTL = language === 'ar';
@@ -797,6 +831,7 @@ module.exports = {
   getLeaveApprovedEmail,
   getLeaveRejectedEmail,
   getPasswordResetEmail,
+  getOrganizationRegistrationVerificationEmail,
   getPasswordResetRequestEmail,
   getPasswordResetByAdminEmail,
   getInvitationEmail,

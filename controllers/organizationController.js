@@ -112,6 +112,15 @@ const mergeObject = (currentValue, patchValue) => ({
   ...(patchValue || {})
 });
 
+const sanitizeBrandingPatch = (branding) => {
+  if (!branding || typeof branding !== 'object') {
+    return undefined;
+  }
+
+  const { supportEmail, ...allowedBrandingFields } = branding;
+  return Object.keys(allowedBrandingFields).length > 0 ? allowedBrandingFields : undefined;
+};
+
 const sendControllerError = (res, error) => {
   if (error.code === 11000) {
     return res.status(400).json({
@@ -163,7 +172,8 @@ const buildPlatformOrganizationPatch = (body) => {
   const departments = parseDepartments(body.departments);
   if (departments !== undefined) patch.departments = departments;
 
-  if (body.branding) patch.branding = body.branding;
+  const branding = sanitizeBrandingPatch(body.branding);
+  if (branding) patch.branding = branding;
   if (body.securitySettings) patch.securitySettings = body.securitySettings;
   if (body.attendanceSettings) patch.attendanceSettings = body.attendanceSettings;
   if (body.leaveSettings) patch.leaveSettings = body.leaveSettings;
@@ -184,7 +194,8 @@ const buildSettingsPatch = (body) => {
   const departments = parseDepartments(body.departments);
   if (departments !== undefined) patch.departments = departments;
 
-  if (body.branding) patch.branding = body.branding;
+  const branding = sanitizeBrandingPatch(body.branding);
+  if (branding) patch.branding = branding;
   if (body.securitySettings) patch.securitySettings = body.securitySettings;
   if (body.attendanceSettings) patch.attendanceSettings = body.attendanceSettings;
   if (body.leaveSettings) patch.leaveSettings = body.leaveSettings;

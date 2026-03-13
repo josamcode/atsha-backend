@@ -3,6 +3,8 @@ const router = express.Router();
 const {
   getOrganizationContext,
   register,
+  sendOrganizationRegistrationVerificationCode,
+  verifyOrganizationRegistrationEmail,
   registerOrganization,
   login,
   refreshToken,
@@ -22,6 +24,8 @@ router.use(resolveOrganization);
 
 router.get('/organization', requireOrganization, getOrganizationContext);
 router.post('/register', requireOrganization, register);
+router.post('/register-organization/send-verification-code', sendOrganizationRegistrationVerificationCode);
+router.post('/register-organization/verify-email', verifyOrganizationRegistrationEmail);
 router.post('/register-organization', registerOrganization);
 router.post('/login', login);
 router.post('/refresh', refreshToken);

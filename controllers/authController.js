@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
+const OrganizationRegistrationVerification = require('../models/OrganizationRegistrationVerification');
 const {
   generateAccessToken,
   generateRefreshToken,
@@ -11,6 +12,7 @@ const {
   sendEmailToUser,
   getPasswordResetEmail,
   getPasswordResetRequestEmail,
+  getOrganizationRegistrationVerificationEmail,
   sendEmailToAdmins
 } = require('../utils/emailService');
 const {
@@ -19,8 +21,27 @@ const {
   toLegacyRole
 } = require('../utils/tenantConstants');
 
+const ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES = 10;
+const ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH = 6;
+const ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT = 3;
+
+const normalizeEmail = (value = '') => String(value || '').trim().toLowerCase();
+const hashTokenValue = (value = '') => crypto.createHash('sha256').update(String(value || '')).digest('hex');
+const buildOrganizationVerificationExpiryDate = () => new Date(
+  Date.now() + (ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES * 60 * 1000)
+);
+const buildOrganizationVerificationExpiryLabel = (language = 'en') => (
+  language === 'ar'
+    ? `${ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES} دقائق`
+    : `${ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES} minutes`
+);
+const generateOrganizationVerificationCode = () => crypto.randomInt(
+  0,
+  10 ** ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH
+).toString().padStart(ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH, '0');
+
 const buildOrganizationScopedEmailQuery = (email, organizationId) => {
-  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const normalizedEmail = normalizeEmail(email);
   const query = { email: normalizedEmail };
 
   if (!organizationId) {
@@ -117,14 +138,95 @@ const buildOrganizationRegistrationPayload = async ({ organizationName, organiza
     displayName: organizationName,
     shortName: organizationName,
     legalName: organizationName,
-    supportEmail: String(email || '').trim().toLowerCase(),
+    supportEmail: normalizeEmail(email),
     emailFromName: organizationName
   }
 });
 
+const claimOrganizationRegistrationVerification = async (email, verificationToken) => (
+  OrganizationRegistrationVerification.findOneAndUpdate(
+    {
+      email: normalizeEmail(email),
+      verificationTokenHash: hashTokenValue(verificationToken),
+      verifiedAt: { $ne: null },
+      consumedAt: null,
+      expiresAt: { $gt: new Date() }
+    },
+    {
+      $set: {
+        consumedAt: new Date()
+      }
+    },
+    {
+      new: true
+    }
+  )
+);
+
+const getDuplicateKeyFields = (error) => {
+  if (error?.keyPattern && typeof error.keyPattern === 'object') {
+    return Object.keys(error.keyPattern);
+  }
+
+  if (error?.keyValue && typeof error.keyValue === 'object') {
+    return Object.keys(error.keyValue);
+  }
+
+  const match = String(error?.message || '').match(/index:\s+([a-zA-Z0-9_]+)_1/);
+  return match ? [match[1]] : [];
+};
+
+const isDuplicateKeyForField = (error, field) => (
+  error?.code === 11000 && getDuplicateKeyFields(error).includes(field)
+);
+
+const createOrganizationWithSlugRetry = async ({ organizationName, organizationSlug, email }) => {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await Organization.create(
+        await buildOrganizationRegistrationPayload({
+          organizationName,
+          organizationSlug,
+          email
+        })
+      );
+    } catch (error) {
+      lastError = error;
+
+      if (!isDuplicateKeyForField(error, 'slug') || attempt === ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT - 1) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
+};
+
+const getOrganizationRegistrationErrorMessage = (error) => {
+  if (error?.name === 'ValidationError') {
+    return Object.values(error.errors).map((entry) => entry.message).join(', ');
+  }
+
+  if (error?.code === 11000) {
+    if (isDuplicateKeyForField(error, 'slug')) {
+      return 'Organization slug already exists';
+    }
+
+    if (isDuplicateKeyForField(error, 'email')) {
+      return 'Email already exists';
+    }
+
+    return 'Duplicate field value entered';
+  }
+
+  return error.message;
+};
+
 const findLoginUserWithoutOrganization = async (email, password) => {
   const users = await User.find({
-    email: String(email || '').trim().toLowerCase()
+    email: normalizeEmail(email)
   })
     .select('+password')
     .limit(20);
@@ -357,6 +459,132 @@ exports.register = async (req, res) => {
   }
 };
 
+// @desc    Send organization registration email verification code
+// @route   POST /api/auth/register-organization/send-verification-code
+// @access  Public
+exports.sendOrganizationRegistrationVerificationCode = async (req, res) => {
+  try {
+    const {
+      email,
+      organizationName,
+      languagePreference
+    } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide an email address'
+      });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+    const preferredLanguage = languagePreference === 'ar' ? 'ar' : 'en';
+    const verificationCode = generateOrganizationVerificationCode();
+
+    await OrganizationRegistrationVerification.findOneAndUpdate(
+      { email: normalizedEmail },
+      {
+        $set: {
+          codeHash: hashTokenValue(verificationCode),
+          expiresAt: buildOrganizationVerificationExpiryDate(),
+          verifiedAt: null,
+          consumedAt: null,
+          languagePreference: preferredLanguage,
+          lastSentAt: new Date()
+        },
+        $unset: {
+          verificationTokenHash: 1
+        }
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+        runValidators: true
+      }
+    );
+
+    const emailResult = await sendEmailToUser(
+      normalizedEmail,
+      (language) => getOrganizationRegistrationVerificationEmail({
+        code: verificationCode,
+        organizationName: organizationName || (language === 'ar' ? 'مؤسستك' : 'your organization'),
+        expiresIn: buildOrganizationVerificationExpiryLabel(language)
+      }, language),
+      preferredLanguage
+    );
+
+    if (!emailResult.success) {
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to send verification code right now'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Verification code sent to your email'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Verify organization registration email code
+// @route   POST /api/auth/register-organization/verify-email
+// @access  Public
+exports.verifyOrganizationRegistrationEmail = async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email and verification code'
+      });
+    }
+
+    const verification = await OrganizationRegistrationVerification.findOne({
+      email: normalizeEmail(email)
+    }).select('+codeHash +verificationTokenHash');
+
+    if (!verification || verification.consumedAt || verification.expiresAt <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code'
+      });
+    }
+
+    if (verification.codeHash !== hashTokenValue(code)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code'
+      });
+    }
+
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    verification.verifiedAt = new Date();
+    verification.verificationTokenHash = hashTokenValue(verificationToken);
+    await verification.save();
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully',
+      data: {
+        verificationToken
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
 // @desc    Register a new organization with its first admin user
 // @route   POST /api/auth/register-organization
 // @access  Public
@@ -369,6 +597,7 @@ exports.registerOrganization = async (req, res) => {
       email,
       password,
       phone,
+      emailVerificationToken,
       languagePreference
     } = req.body;
 
@@ -379,6 +608,13 @@ exports.registerOrganization = async (req, res) => {
       });
     }
 
+    if (!emailVerificationToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please verify your email before registering the organization'
+      });
+    }
+
     if (password.length < 6) {
       return res.status(400).json({
         success: false,
@@ -386,18 +622,25 @@ exports.registerOrganization = async (req, res) => {
       });
     }
 
+    const emailVerification = await claimOrganizationRegistrationVerification(email, emailVerificationToken);
+    if (!emailVerification) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please verify your email before registering the organization'
+      });
+    }
+
     let organization = null;
+    let user = null;
 
     try {
-      organization = await Organization.create(
-        await buildOrganizationRegistrationPayload({
-          organizationName,
-          organizationSlug,
-          email
-        })
-      );
+      organization = await createOrganizationWithSlugRetry({
+        organizationName,
+        organizationSlug,
+        email
+      });
 
-      const user = await User.create({
+      user = await User.create({
         organizationId: organization._id,
         name,
         email,
@@ -432,6 +675,21 @@ exports.registerOrganization = async (req, res) => {
         refreshToken
       }));
     } catch (error) {
+      if (emailVerification?._id) {
+        await OrganizationRegistrationVerification.updateOne(
+          { _id: emailVerification._id },
+          {
+            $set: {
+              consumedAt: null
+            }
+          }
+        );
+      }
+
+      if (user?._id) {
+        await User.deleteOne({ _id: user._id });
+      }
+
       if (organization?._id) {
         await Organization.deleteOne({ _id: organization._id });
       }
@@ -443,9 +701,7 @@ exports.registerOrganization = async (req, res) => {
 
     res.status(statusCode).json({
       success: false,
-      message: error.code === 11000
-        ? 'Organization slug already exists'
-        : error.message
+      message: getOrganizationRegistrationErrorMessage(error)
     });
   }
 };
