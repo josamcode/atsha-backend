@@ -1,6 +1,7 @@
 const Organization = require('../models/Organization');
 const User = require('../models/User');
 const Invitation = require('../models/Invitation');
+const FormInstance = require('../models/FormInstance');
 const { createAuditLog } = require('../utils/auditLogger');
 const { deleteStoredAsset, uploadOrganizationBrandingAsset } = require('../utils/mediaStorage');
 const { resolveManagedOrganization } = require('../utils/organizationAccess');
@@ -173,16 +174,21 @@ const sendControllerError = (res, error) => {
 };
 
 const getOrganizationSummary = async (organizationId) => {
-  const [userCount, activeUserCount, pendingInvitationCount] = await Promise.all([
+  const [userCount, activeUserCount, pendingInvitationCount, filledFormsCount] = await Promise.all([
     User.countDocuments({ organizationId }),
     User.countDocuments({ organizationId, isActive: true }),
-    Invitation.countDocuments({ organizationId, status: 'pending' })
+    Invitation.countDocuments({ organizationId, status: 'pending' }),
+    FormInstance.countDocuments({
+      organizationId,
+      status: { $ne: 'draft' }
+    })
   ]);
 
   return {
     users: userCount,
     activeUsers: activeUserCount,
-    pendingInvitations: pendingInvitationCount
+    pendingInvitations: pendingInvitationCount,
+    filledForms: filledFormsCount
   };
 };
 
