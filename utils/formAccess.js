@@ -6,6 +6,7 @@ const {
   normalizeRole,
   toLegacyRole
 } = require('./tenantConstants');
+const { organizationIdsMatch, resolveOrganizationId } = require('./organizationId');
 const { isPlatformAdmin } = require('./organizationAccess');
 
 const ALLOWED_TEMPLATE_ROLES = new Set(
@@ -19,13 +20,14 @@ const createHttpError = (statusCode, message) => {
 };
 
 const getRequestedOrganizationId = (req) => (
-  req.body.organizationId ||
-  req.query.organizationId ||
+  resolveOrganizationId(req.body.organizationId) ||
+  resolveOrganizationId(req.query.organizationId) ||
   null
 );
 
 const resolveFormsOrganization = async (req, fallbackOrganizationId = null) => {
-  const requestedOrganizationId = getRequestedOrganizationId(req) || fallbackOrganizationId || null;
+  const resolvedFallbackOrganizationId = resolveOrganizationId(fallbackOrganizationId);
+  const requestedOrganizationId = getRequestedOrganizationId(req) || resolvedFallbackOrganizationId || null;
 
   if (isPlatformAdmin(req.user)) {
     if (requestedOrganizationId) {
@@ -49,11 +51,11 @@ const resolveFormsOrganization = async (req, fallbackOrganizationId = null) => {
     throw createHttpError(400, 'Organization context is required');
   }
 
-  if (requestedOrganizationId && String(req.organization._id) !== String(requestedOrganizationId)) {
+  if (requestedOrganizationId && !organizationIdsMatch(req.organization, requestedOrganizationId)) {
     throw createHttpError(403, 'You do not have access to this organization');
   }
 
-  if (fallbackOrganizationId && String(req.organization._id) !== String(fallbackOrganizationId)) {
+  if (resolvedFallbackOrganizationId && !organizationIdsMatch(req.organization, resolvedFallbackOrganizationId)) {
     throw createHttpError(403, 'Record does not belong to the active organization');
   }
 

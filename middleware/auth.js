@@ -7,6 +7,7 @@ const {
   roleMatches,
   toLegacyRole
 } = require('../utils/tenantConstants');
+const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
 
 const { resolveOrganizationContext } = resolveOrganization;
 
@@ -67,7 +68,7 @@ exports.protect = async (req, res, next) => {
       await resolveOrganizationContext(req);
     }
 
-    const tokenOrganization = await findOrganizationById(decoded.organizationId);
+    const tokenOrganization = await findOrganizationById(resolveOrganizationId(decoded.organizationId));
     if (decoded.organizationId && !tokenOrganization) {
       return res.status(401).json({
         success: false,
@@ -75,7 +76,7 @@ exports.protect = async (req, res, next) => {
       });
     }
 
-    if (req.organization && tokenOrganization && String(req.organization._id) !== String(tokenOrganization._id)) {
+    if (req.organization && tokenOrganization && !organizationIdsMatch(req.organization, tokenOrganization)) {
       return res.status(401).json({
         success: false,
         message: 'Token organization does not match the active organization'
@@ -91,7 +92,7 @@ exports.protect = async (req, res, next) => {
     }
 
     if (!req.organization && user.organizationId) {
-      req.organization = await findOrganizationById(user.organizationId);
+      req.organization = await findOrganizationById(resolveOrganizationId(user.organizationId));
     }
 
     if (!req.organization && tokenOrganization) {
@@ -105,7 +106,7 @@ exports.protect = async (req, res, next) => {
       });
     }
 
-    if (user.organizationId && String(user.organizationId) !== String(req.organization._id)) {
+    if (user.organizationId && !organizationIdsMatch(user.organizationId, req.organization)) {
       return res.status(401).json({
         success: false,
         message: 'User does not belong to the active organization'
@@ -145,7 +146,7 @@ exports.protect = async (req, res, next) => {
     user.legacyRole = toLegacyRole(user.role);
     req.user = user;
     req.auth = {
-      organizationId: req.organization._id,
+      organizationId: resolveOrganizationId(req.organization),
       role: user.organizationRole,
       legacyRole: user.legacyRole,
       tokenRole: decoded.role || null

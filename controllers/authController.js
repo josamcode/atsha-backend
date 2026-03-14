@@ -22,6 +22,7 @@ const {
   normalizeRole,
   toLegacyRole
 } = require('../utils/tenantConstants');
+const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
 const { assertUserSeatAvailable } = require('../utils/subscription');
 const { DEFAULT_PLATFORM_PROFILE } = require('../utils/platformDefaults');
 
@@ -125,7 +126,7 @@ const resolveOrganizationForUser = async (user) => {
   }
 
   if (user.organizationId) {
-    return Organization.findById(user.organizationId).lean();
+    return Organization.findById(resolveOrganizationId(user.organizationId)).lean();
   }
 
   return findSingleActiveOrganization();
@@ -313,7 +314,7 @@ const resolvePasswordResetTargets = async (email, scopedOrganization = null) => 
 
   const organizationIds = [...new Set(
     users
-      .map((user) => user.organizationId ? String(user.organizationId) : null)
+      .map((user) => resolveOrganizationId(user.organizationId))
       .filter(Boolean)
   )];
 
@@ -321,13 +322,13 @@ const resolvePasswordResetTargets = async (email, scopedOrganization = null) => 
     ? await Organization.find({ _id: { $in: organizationIds } }).lean()
     : [];
   const organizationsById = new Map(
-    organizations.map((organization) => [String(organization._id), organization])
+    organizations.map((organization) => [resolveOrganizationId(organization), organization])
   );
 
   const targets = [];
   for (const user of users) {
     const organization = user.organizationId
-      ? organizationsById.get(String(user.organizationId)) || null
+      ? organizationsById.get(resolveOrganizationId(user.organizationId)) || null
       : await resolveOrganizationForUser(user);
 
     if (!organization) {
@@ -428,7 +429,7 @@ const ensureUserBelongsToOrganization = (user, organization, res) => {
     return true;
   }
 
-  if (String(user.organizationId) !== String(organization._id)) {
+  if (!organizationIdsMatch(user.organizationId, organization)) {
     res.status(401).json({
       success: false,
       message: 'User does not belong to the active organization'
@@ -950,7 +951,7 @@ exports.refreshToken = async (req, res) => {
         });
       }
 
-      if (organization && String(organization._id) !== String(tokenOrganization._id)) {
+      if (organization && !organizationIdsMatch(organization, tokenOrganization)) {
         return res.status(401).json({
           success: false,
           message: 'Refresh token organization does not match the active organization'
@@ -1264,7 +1265,7 @@ exports.resetPassword = async (req, res) => {
       organization = await Organization.findById(user.organizationId).lean();
     }
 
-    if (organization && user.organizationId && String(user.organizationId) !== String(organization._id)) {
+    if (organization && user.organizationId && !organizationIdsMatch(user.organizationId, organization)) {
       return res.status(400).json({
         success: false,
         message: 'Reset token does not belong to the active organization'

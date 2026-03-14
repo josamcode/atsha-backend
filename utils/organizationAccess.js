@@ -1,27 +1,33 @@
 const Organization = require('../models/Organization');
 const { normalizeRole } = require('./tenantConstants');
+const { organizationIdsMatch, resolveOrganizationId } = require('./organizationId');
 
 const isPlatformAdmin = (user) => normalizeRole(user?.role) === 'platform_admin';
 const isOrganizationAdmin = (user) => normalizeRole(user?.role) === 'organization_admin';
 
 const resolveManagedOrganization = async (req, organizationId) => {
+  const resolvedOrganizationId = resolveOrganizationId(organizationId);
+  const activeOrganizationId = resolveOrganizationId(req.organization);
+
   if (isPlatformAdmin(req.user)) {
-    if (organizationId) {
-      return Organization.findById(organizationId);
+    if (resolvedOrganizationId) {
+      return Organization.findById(resolvedOrganizationId);
     }
 
-    return req.organization ? Organization.findById(req.organization._id) : null;
+    return activeOrganizationId ? Organization.findById(activeOrganizationId) : null;
   }
 
-  if (isOrganizationAdmin(req.user) && req.organization?._id) {
-    return Organization.findById(req.organization._id);
+  if (isOrganizationAdmin(req.user) && activeOrganizationId) {
+    return Organization.findById(activeOrganizationId);
   }
 
   return null;
 };
 
 const ensureOrganizationAccess = (req, organizationId) => {
-  if (!organizationId) {
+  const resolvedOrganizationId = resolveOrganizationId(organizationId);
+
+  if (!resolvedOrganizationId) {
     return false;
   }
 
@@ -30,7 +36,7 @@ const ensureOrganizationAccess = (req, organizationId) => {
   }
 
   if (isOrganizationAdmin(req.user) && req.organization?._id) {
-    return String(req.organization._id) === String(organizationId);
+    return organizationIdsMatch(req.organization, resolvedOrganizationId);
   }
 
   return false;

@@ -1,21 +1,26 @@
+const { organizationIdsMatch, resolveOrganizationId } = require('./organizationId');
+
 const getOrganizationId = (source) => {
   if (!source) {
     return null;
   }
 
-  if (source.organization && source.organization._id) {
-    return source.organization._id;
+  const nestedOrganizationId = resolveOrganizationId(source.organization);
+  if (nestedOrganizationId) {
+    return nestedOrganizationId;
   }
 
-  if (source.organizationId) {
-    return source.organizationId;
+  const directOrganizationId = resolveOrganizationId(source.organizationId);
+  if (directOrganizationId) {
+    return directOrganizationId;
   }
 
-  if (source._id) {
-    return source._id;
+  const sourceId = resolveOrganizationId(source._id);
+  if (sourceId) {
+    return sourceId;
   }
 
-  return null;
+  return resolveOrganizationId(source);
 };
 
 const buildTenantQuery = (req, query = {}) => {
@@ -51,7 +56,7 @@ const assertSameOrganization = (record, source) => {
     return false;
   }
 
-  return String(record.organizationId) === String(organizationId);
+  return organizationIdsMatch(record.organizationId, organizationId);
 };
 
 const requireSameOrganization = (record, source, errorMessage = 'Record does not belong to the active organization') => {

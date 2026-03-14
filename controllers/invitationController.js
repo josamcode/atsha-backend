@@ -6,6 +6,7 @@ const {
   ensureOrganizationAccess,
   resolveManagedOrganization
 } = require('../utils/organizationAccess');
+const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
 const { sendEmailToUser, getInvitationEmail } = require('../utils/emailService');
 const {
   normalizeDepartmentCode,
@@ -94,9 +95,9 @@ const buildActivationUrl = (organization, token) => {
 };
 
 const getRequestedOrganizationId = (req) => (
-  req.body.organizationId ||
-  req.query.organizationId ||
-  req.params.organizationId ||
+  resolveOrganizationId(req.body.organizationId) ||
+  resolveOrganizationId(req.query.organizationId) ||
+  resolveOrganizationId(req.params.organizationId) ||
   null
 );
 
@@ -337,7 +338,7 @@ exports.getInvitationPreview = async (req, res) => {
       });
     }
 
-    if (req.organization && String(req.organization._id) !== String(organization._id)) {
+    if (req.organization && !organizationIdsMatch(req.organization, organization)) {
       return res.status(400).json({
         success: false,
         message: 'Invitation does not belong to the active organization'
@@ -394,7 +395,7 @@ exports.acceptInvitation = async (req, res) => {
       });
     }
 
-    if (req.organization && String(req.organization._id) !== String(organization._id)) {
+    if (req.organization && !organizationIdsMatch(req.organization, organization)) {
       return res.status(400).json({
         success: false,
         message: 'Invitation does not belong to the active organization'

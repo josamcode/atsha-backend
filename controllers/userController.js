@@ -20,6 +20,7 @@ const {
   isPlatformAdmin,
   resolveManagedOrganization
 } = require('../utils/organizationAccess');
+const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
 const {
   attachOrganizationId,
   buildTenantQuery,
@@ -158,8 +159,8 @@ const formatUser = (user) => {
 };
 
 const getRequestedOrganizationId = (req) => (
-  req.body.organizationId ||
-  req.query.organizationId ||
+  resolveOrganizationId(req.body.organizationId) ||
+  resolveOrganizationId(req.query.organizationId) ||
   null
 );
 
@@ -179,7 +180,7 @@ const resolveUserManagementOrganization = async (req) => {
     return organization;
   }
 
-  if (requestedOrganizationId && (!req.organization || String(req.organization._id) !== String(requestedOrganizationId))) {
+  if (requestedOrganizationId && (!req.organization || !organizationIdsMatch(req.organization, requestedOrganizationId))) {
     throw createHttpError(403, 'You do not have access to this organization');
   }
 
@@ -373,7 +374,7 @@ const ensureUserAccess = (req, user, organization) => {
   const targetRole = normalizeRole(user?.role);
 
   if (isPlatformAdmin(req.user)) {
-    if (organization && user.organizationId && String(user.organizationId) !== String(organization._id)) {
+    if (organization && user.organizationId && !organizationIdsMatch(user.organizationId, organization)) {
       throw createHttpError(403, 'User does not belong to the selected organization');
     }
 

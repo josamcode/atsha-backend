@@ -48,6 +48,7 @@ app.use('/uploads', (req, res, next) => {
 // Enable CORS
 const allowedOrigins = [
   'http://localhost:3000',
+  'http://192.168.56.1:3000',
   "https://atsha-frontend.vercel.app",
   "https://atshaplus.com",
   "https://www.atshaplus.com"
