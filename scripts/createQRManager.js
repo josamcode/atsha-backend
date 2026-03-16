@@ -19,7 +19,7 @@ const createQRManager = async () => {
     }
 
     // Default QR Manager credentials
-    const defaultEmail = process.env.QR_MANAGER_EMAIL || 'qrmanager@atsha.com';
+    const defaultEmail = process.env.QR_MANAGER_EMAIL || 'qrmanager@AraRM.com';
     const defaultPassword = process.env.QR_MANAGER_PASSWORD || 'QRManager123!';
     const defaultName = process.env.QR_MANAGER_NAME || 'QR Manager';
 

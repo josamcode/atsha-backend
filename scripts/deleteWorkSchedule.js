@@ -46,7 +46,7 @@ async function deleteWorkSchedule() {
     if (!mongoUri) {
       console.error('❌ Error: MONGODB_URI environment variable is not set');
       console.error('   Please set MONGODB_URI in your .env file');
-      console.error('   Example: MONGODB_URI=mongodb://localhost:27017/atsha');
+      console.error('   Example: MONGODB_URI=mongodb://localhost:27017/AraRM');
       process.exit(1);
     }
 

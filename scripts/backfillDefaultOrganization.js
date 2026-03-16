@@ -78,8 +78,8 @@ const missingOrganizationQuery = {
 const run = async () => {
   await connectDB();
 
-  const organizationName = getArgValue('name') || process.env.DEFAULT_ORGANIZATION_NAME || 'Atsha';
-  const organizationSlug = getArgValue('slug') || process.env.DEFAULT_ORGANIZATION_SLUG || 'atsha';
+  const organizationName = getArgValue('name') || process.env.DEFAULT_ORGANIZATION_NAME || 'AraRM';
+  const organizationSlug = getArgValue('slug') || process.env.DEFAULT_ORGANIZATION_SLUG || 'AraRM';
   const rawDomains = process.env.DEFAULT_ORGANIZATION_DOMAINS || process.env.FRONTEND_URL || '';
   const allowedDomains = [...new Set(rawDomains
     .split(',')

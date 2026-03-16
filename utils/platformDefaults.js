@@ -1,5 +1,5 @@
 const DEFAULT_PLATFORM_PROFILE = Object.freeze({
-  platformName: 'atsha',
+  platformName: 'AraRM',
   supportEmail: '',
   websiteUrl: '',
   locale: 'en',

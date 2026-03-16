@@ -253,15 +253,15 @@ const getEmailTemplate = (title, content, language = 'en') => {
   <div class="wrapper">
     <div class="email-container">
       <div class="email-header">
-        <h1>Atsha</h1>
+        <h1>AraRM</h1>
         <p>${language === 'ar' ? 'نظام الإدارة المتقدم' : 'Advanced Management System'}</p>
       </div>
       <div class="email-body">
         ${content}
       </div>
       <div class="email-footer">
-        <p style="font-weight: 600; color: #475569;">Atsha</p>
-        <p>${language === 'ar' ? '© 2025 atsha. جميع الحقوق محفوظة.' : '© 2025 atsha. All rights reserved.'}</p>
+        <p style="font-weight: 600; color: #475569;">AraRM</p>
+        <p>${language === 'ar' ? '© 2025 AraRM. جميع الحقوق محفوظة.' : '© 2025 AraRM. All rights reserved.'}</p>
         <div class="footer-links">
           <p class="text-sm">
             ${language === 'ar' ? 'هذه رسالة تلقائية، يرجى عدم الرد عليها مباشرة.' : 'This is an automated message, please do not reply directly to this email.'}
@@ -288,7 +288,7 @@ const sendEmail = async ({ to, subject, html, text }) => {
     const transporter = createTransporter();
 
     const mailOptions = {
-      from: `"Atsha" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+      from: `"AraRM" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
       to: Array.isArray(to) ? to.join(', ') : to,
       subject: subject,
       html: html,
@@ -382,7 +382,7 @@ const getFormApprovedEmail = (formData, language = 'en') => {
       <p><strong>${isRTL ? 'تمت الموافقة بواسطة:' : 'Approved By:'}</strong> ${approvedBy}</p>
       ${formData.approvalDate ? `<p><strong>${isRTL ? 'تاريخ الموافقة:' : 'Approval Date:'}</strong> ${formatEmailDate(formData.approvalDate, language)}</p>` : ''}
     </div>
-    <p>${isRTL ? 'شكراً لاستخدامك نظام atsha.' : 'Thank you for using atsha system.'}</p>
+    <p>${isRTL ? 'شكراً لاستخدامك نظام AraRM.' : 'Thank you for using AraRM system.'}</p>
   `;
 
   return {
@@ -696,8 +696,8 @@ const getOrganizationRegistrationVerificationEmail = (verificationData, language
     </p>
     <p style="font-size: 14px; color: #6b7280;">
       ${isRTL
-        ? 'إذا لم تطلب إنشاء مؤسسة جديدة، يمكنك تجاهل هذا البريد.'
-        : 'If you did not request a new organization account, you can ignore this email.'}
+      ? 'إذا لم تطلب إنشاء مؤسسة جديدة، يمكنك تجاهل هذا البريد.'
+      : 'If you did not request a new organization account, you can ignore this email.'}
     </p>
   `;
 
@@ -812,7 +812,7 @@ const getEmployeeReportEmail = (data, language = 'en') => {
     </div>
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? 'يرجى الاطلاع على التقرير للحصول على تفاصيل كاملة عن حضورك وإجازاتك وأدائك خلال هذا الشهر.' : 'Please review the report for complete details about your attendance, leaves, and performance during this month.'}</p>
     <p style="text-align: ${isRTL ? 'right' : 'left'}; margin-bottom: 15px;">${isRTL ? 'إذا كان لديك أي استفسارات، يرجى التواصل معنا.' : 'If you have any questions, please feel free to contact us.'}</p>
-    <p style="text-align: ${isRTL ? 'right' : 'left'}; font-size: 12px; color: #6b7280;">${isRTL ? 'فريق إدارة atsha' : 'atsha Management Team'}</p>
+    <p style="text-align: ${isRTL ? 'right' : 'left'}; font-size: 12px; color: #6b7280;">${isRTL ? 'فريق إدارة AraRM' : 'AraRM Management Team'}</p>
   `;
   return {
     subject: title,

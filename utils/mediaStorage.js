@@ -17,7 +17,7 @@ if (cloudinaryConfigured) {
   });
 }
 
-const uploadRootFolder = process.env.CLOUDINARY_FOLDER || 'atsha';
+const uploadRootFolder = process.env.CLOUDINARY_FOLDER || 'AraRM';
 
 const sanitizeFilename = (filename = 'file') => {
   const parsed = path.parse(filename);

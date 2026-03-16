@@ -23,7 +23,7 @@ class PDFGenerator {
     const templatePdfStyle = template.pdfStyle || {};
     const templateBranding = templatePdfStyle.branding || {};
     const organizationBranding = organization?.branding || {};
-    const organizationDisplayName = organizationBranding.displayName || organization?.name || 'atsha';
+    const organizationDisplayName = organizationBranding.displayName || organization?.name || 'AraRM';
 
     return {
       ...templatePdfStyle,
@@ -158,7 +158,7 @@ class PDFGenerator {
     const headerTextColor = headerConfig.textColor || '#000000';
     const headerFontSize = headerConfig.fontSize || 16;
     const primaryColor = branding.primaryColor || pdfStyle.colors?.primary || '#d4b900';
-    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'atsha';
+    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'AraRM';
 
     // Draw header background
     doc.rect(margins.left, margins.top, doc.page.width - margins.left - margins.right, headerHeight)
@@ -538,7 +538,7 @@ class PDFGenerator {
     const footerTextColor = footerConfig.textColor || '#6b7280';
     const footerFontSize = footerConfig.fontSize || 8;
     const pages = doc.bufferedPageRange();
-    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'atsha';
+    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'AraRM';
     const footerContent = footerConfig.content?.[language] || footerConfig.content?.en ||
       `${companyName} Restaurant Management System`;
     const phoneNumber = footerConfig.phoneNumber || branding.companyPhone || '';
