@@ -20,6 +20,7 @@ const formatOrganizationForClient = async (organization, options = {}) => {
   return {
     ...source,
     id: source._id,
+    subscriptionConfig: source.subscription || {},
     subscription,
     ...(summary ? { summary } : {})
   };

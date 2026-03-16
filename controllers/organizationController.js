@@ -110,6 +110,23 @@ const mergeObject = (currentValue, patchValue) => ({
   ...(patchValue || {})
 });
 
+const mergeSubscriptionConfig = (currentValue, patchValue) => {
+  const nextValue = {
+    ...(currentValue || {}),
+    ...(patchValue || {})
+  };
+
+  if (patchValue && Object.prototype.hasOwnProperty.call(patchValue, 'customLimits')) {
+    nextValue.customLimits = { ...(patchValue.customLimits || {}) };
+  }
+
+  if (patchValue && Object.prototype.hasOwnProperty.call(patchValue, 'customFeatures')) {
+    nextValue.customFeatures = { ...(patchValue.customFeatures || {}) };
+  }
+
+  return nextValue;
+};
+
 const sanitizeBrandingPatch = (branding) => {
   if (!branding || typeof branding !== 'object') {
     return undefined;
@@ -595,7 +612,7 @@ exports.updateOrganization = async (req, res) => {
     if (patch.leaveSettings) organization.leaveSettings = mergeObject(organization.leaveSettings, patch.leaveSettings);
     if (patch.featureFlags) organization.featureFlags = mergeObject(organization.featureFlags, patch.featureFlags);
     if (patch.subscription) {
-      organization.subscription = mergeObject(organization.subscription, patch.subscription);
+      organization.subscription = mergeSubscriptionConfig(organization.subscription, patch.subscription);
       if (patch.subscription.planCode) {
         organization.plan = patch.subscription.planCode;
       }
