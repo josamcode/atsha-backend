@@ -1,5 +1,6 @@
 const Organization = require('../models/Organization');
 const BillingPayment = require('../models/BillingPayment');
+const User = require('../models/User');
 const { createAuditLog } = require('../utils/auditLogger');
 const logger = require('../utils/logger');
 const paymentConfig = require('../utils/paymentConfig');
@@ -199,6 +200,119 @@ const serializePayment = (paymentRecord) => ({
   createdAt: paymentRecord.createdAt,
   updatedAt: paymentRecord.updatedAt
 });
+
+const serializeOrganizationSummary = (organizationValue) => {
+  if (!organizationValue || typeof organizationValue !== 'object' || Array.isArray(organizationValue)) {
+    return organizationValue || null;
+  }
+
+  return {
+    id: organizationValue._id,
+    name: organizationValue.branding?.displayName || organizationValue.name || null,
+    legalName: organizationValue.name || null,
+    slug: organizationValue.slug || null
+  };
+};
+
+const serializeUserSummary = (userValue) => {
+  if (!userValue || typeof userValue !== 'object' || Array.isArray(userValue)) {
+    return userValue || null;
+  }
+
+  return {
+    id: userValue._id,
+    name: userValue.name || null,
+    email: userValue.email || null
+  };
+};
+
+const serializeAdminPayment = (paymentRecord) => ({
+  ...serializePayment(paymentRecord),
+  organization: serializeOrganizationSummary(paymentRecord.organization),
+  initiatedBy: serializeUserSummary(paymentRecord.initiatedBy)
+});
+
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const normalizeAnalyticsWindowDays = (value) => {
+  const parsedValue = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsedValue)) {
+    return 30;
+  }
+
+  return Math.min(90, Math.max(7, parsedValue));
+};
+
+const buildDateKeys = (days) => {
+  const keys = [];
+  const currentDate = new Date();
+  currentDate.setHours(0, 0, 0, 0);
+
+  for (let index = days - 1; index >= 0; index -= 1) {
+    const nextDate = new Date(currentDate);
+    nextDate.setDate(currentDate.getDate() - index);
+    keys.push(nextDate.toISOString().slice(0, 10));
+  }
+
+  return keys;
+};
+
+const buildAdminPaymentSearchFilter = async (rawSearch) => {
+  const search = String(rawSearch || '').trim();
+  if (!search) {
+    return null;
+  }
+
+  const regex = new RegExp(escapeRegex(search), 'i');
+  const [organizations, users] = await Promise.all([
+    Organization.find({
+      $or: [
+        { name: regex },
+        { slug: regex },
+        { 'branding.displayName': regex }
+      ]
+    })
+      .select('_id')
+      .lean(),
+    User.find({
+      $or: [
+        { name: regex },
+        { email: regex }
+      ]
+    })
+      .select('_id')
+      .lean()
+  ]);
+
+  const orConditions = [
+    { invoiceId: regex },
+    { paymentId: regex },
+    { organizationSlug: regex },
+    { planCode: regex },
+    { 'planSnapshot.name.en': regex },
+    { 'planSnapshot.name.ar': regex }
+  ];
+
+  if (organizations.length > 0) {
+    orConditions.push({
+      organization: {
+        $in: organizations.map((organization) => organization._id)
+      }
+    });
+  }
+
+  if (users.length > 0) {
+    orConditions.push({
+      initiatedBy: {
+        $in: users.map((user) => user._id)
+      }
+    });
+  }
+
+  return {
+    $or: orConditions
+  };
+};
 
 const resolveNextSubscriptionWindow = ({
   organization,
@@ -723,6 +837,320 @@ exports.getBillingHistory = async (req, res, next) => {
         ...serializePayment(payment),
         initiatedBy: payment.initiatedBy
       }))
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getAdminPayments = async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 10));
+    const skip = (page - 1) * limit;
+    const filter = {};
+
+    if (req.query.status) {
+      filter.status = String(req.query.status).trim().toLowerCase();
+    }
+
+    if (req.query.provider) {
+      filter.provider = String(req.query.provider).trim().toLowerCase();
+    }
+
+    const searchFilter = await buildAdminPaymentSearchFilter(req.query.search);
+    if (searchFilter) {
+      Object.assign(filter, searchFilter);
+    }
+
+    const [payments, total] = await Promise.all([
+      BillingPayment.find(filter)
+        .populate('organization', 'name slug branding.displayName')
+        .populate('initiatedBy', 'name email')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      BillingPayment.countDocuments(filter)
+    ]);
+
+    res.json({
+      success: true,
+      count: payments.length,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      data: payments.map((payment) => serializeAdminPayment(payment))
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getAdminPaymentsAnalytics = async (req, res, next) => {
+  try {
+    const days = normalizeAnalyticsWindowDays(req.query.days);
+    const recentLimit = Math.min(25, Math.max(3, Number.parseInt(req.query.recentLimit, 10) || 8));
+    const startDate = new Date();
+    startDate.setHours(0, 0, 0, 0);
+    startDate.setDate(startDate.getDate() - (days - 1));
+
+    const [
+      statusGroups,
+      providerGroups,
+      billingCycleGroups,
+      revenueGroups,
+      paymentTrendRows,
+      revenueTrendRows,
+      planRows,
+      organizationRows,
+      recentPayments
+    ] = await Promise.all([
+      BillingPayment.aggregate([
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      BillingPayment.aggregate([
+        {
+          $group: {
+            _id: '$provider',
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      BillingPayment.aggregate([
+        {
+          $group: {
+            _id: '$billingCycle',
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      BillingPayment.aggregate([
+        { $match: { status: 'paid' } },
+        {
+          $group: {
+            _id: null,
+            totalAmount: { $sum: '$amount' },
+            paidCount: { $sum: 1 }
+          }
+        }
+      ]),
+      BillingPayment.aggregate([
+        { $match: { createdAt: { $gte: startDate } } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: '%Y-%m-%d',
+                date: '$createdAt'
+              }
+            },
+            count: { $sum: 1 },
+            paidCount: {
+              $sum: {
+                $cond: [{ $eq: ['$status', 'paid'] }, 1, 0]
+              }
+            },
+            failedCount: {
+              $sum: {
+                $cond: [{ $in: ['$status', ['failed', 'cancelled']] }, 1, 0]
+              }
+            }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      BillingPayment.aggregate([
+        {
+          $match: {
+            status: 'paid',
+            paidAt: { $gte: startDate }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: '%Y-%m-%d',
+                date: '$paidAt'
+              }
+            },
+            amount: { $sum: '$amount' },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      BillingPayment.aggregate([
+        {
+          $group: {
+            _id: '$planCode',
+            planNameEn: { $first: '$planSnapshot.name.en' },
+            planNameAr: { $first: '$planSnapshot.name.ar' },
+            totalPayments: { $sum: 1 },
+            paidPayments: {
+              $sum: {
+                $cond: [{ $eq: ['$status', 'paid'] }, 1, 0]
+              }
+            },
+            revenue: {
+              $sum: {
+                $cond: [{ $eq: ['$status', 'paid'] }, '$amount', 0]
+              }
+            },
+            currency: { $first: '$currency' }
+          }
+        },
+        { $sort: { revenue: -1, totalPayments: -1, _id: 1 } },
+        { $limit: 6 }
+      ]),
+      BillingPayment.aggregate([
+        {
+          $lookup: {
+            from: 'organizations',
+            localField: 'organization',
+            foreignField: '_id',
+            as: 'organizationDoc'
+          }
+        },
+        {
+          $unwind: {
+            path: '$organizationDoc',
+            preserveNullAndEmptyArrays: true
+          }
+        },
+        {
+          $group: {
+            _id: '$organization',
+            organizationName: { $first: '$organizationDoc.name' },
+            organizationDisplayName: { $first: '$organizationDoc.branding.displayName' },
+            organizationSlug: { $first: '$organizationDoc.slug' },
+            totalPayments: { $sum: 1 },
+            paidPayments: {
+              $sum: {
+                $cond: [{ $eq: ['$status', 'paid'] }, 1, 0]
+              }
+            },
+            revenue: {
+              $sum: {
+                $cond: [{ $eq: ['$status', 'paid'] }, '$amount', 0]
+              }
+            },
+            currency: { $first: '$currency' }
+          }
+        },
+        { $sort: { revenue: -1, totalPayments: -1 } },
+        { $limit: 6 }
+      ]),
+      BillingPayment.find({})
+        .populate('organization', 'name slug branding.displayName')
+        .populate('initiatedBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(recentLimit)
+        .lean()
+    ]);
+
+    const statusMap = statusGroups.reduce((accumulator, row) => {
+      accumulator[row._id] = row.count;
+      return accumulator;
+    }, {});
+    const providerMap = providerGroups.reduce((accumulator, row) => {
+      accumulator[row._id] = row.count;
+      return accumulator;
+    }, {});
+    const billingCycleMap = billingCycleGroups.reduce((accumulator, row) => {
+      accumulator[row._id] = row.count;
+      return accumulator;
+    }, {});
+    const revenueTotals = revenueGroups[0] || {
+      totalAmount: 0,
+      paidCount: 0
+    };
+    const totalPayments = Object.values(statusMap).reduce((sum, value) => sum + value, 0);
+    const dateKeys = buildDateKeys(days);
+    const paymentTrendLookup = paymentTrendRows.reduce((accumulator, row) => {
+      accumulator[row._id] = row;
+      return accumulator;
+    }, {});
+    const revenueTrendLookup = revenueTrendRows.reduce((accumulator, row) => {
+      accumulator[row._id] = row;
+      return accumulator;
+    }, {});
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          totalPayments,
+          paidPayments: statusMap.paid || 0,
+          pendingPayments: statusMap.pending || 0,
+          processingPayments: statusMap.processing || 0,
+          failedPayments: statusMap.failed || 0,
+          cancelledPayments: statusMap.cancelled || 0,
+          successRate: totalPayments > 0
+            ? Number((((statusMap.paid || 0) / totalPayments) * 100).toFixed(1))
+            : 0
+        },
+        revenue: {
+          totalAmount: revenueTotals.totalAmount || 0,
+          paidCount: revenueTotals.paidCount || 0,
+          averagePaidAmount: revenueTotals.paidCount > 0
+            ? Number(((revenueTotals.totalAmount || 0) / revenueTotals.paidCount).toFixed(2))
+            : 0,
+          currency: 'SAR'
+        },
+        breakdown: {
+          byStatus: ['paid', 'pending', 'processing', 'failed', 'cancelled'].map((key) => ({
+            key,
+            count: statusMap[key] || 0
+          })),
+          byProvider: Object.entries(providerMap).map(([key, count]) => ({
+            key,
+            count
+          })),
+          byBillingCycle: SUPPORTED_BILLING_CYCLES.map((key) => ({
+            key,
+            count: billingCycleMap[key] || 0
+          })),
+          topPlans: planRows.map((row) => ({
+            planCode: row._id,
+            planName: {
+              en: row.planNameEn || row._id,
+              ar: row.planNameAr || row.planNameEn || row._id
+            },
+            totalPayments: row.totalPayments || 0,
+            paidPayments: row.paidPayments || 0,
+            revenue: row.revenue || 0,
+            currency: row.currency || 'SAR'
+          })),
+          topOrganizations: organizationRows.map((row) => ({
+            organizationId: row._id,
+            organizationName: row.organizationDisplayName || row.organizationName || row.organizationSlug || '--',
+            organizationSlug: row.organizationSlug || null,
+            totalPayments: row.totalPayments || 0,
+            paidPayments: row.paidPayments || 0,
+            revenue: row.revenue || 0,
+            currency: row.currency || 'SAR'
+          }))
+        },
+        trends: {
+          daily: dateKeys.map((date) => ({
+            date,
+            payments: paymentTrendLookup[date]?.count || 0,
+            paidPayments: paymentTrendLookup[date]?.paidCount || 0,
+            failedPayments: paymentTrendLookup[date]?.failedCount || 0,
+            revenue: revenueTrendLookup[date]?.amount || 0,
+            revenuePayments: revenueTrendLookup[date]?.count || 0
+          }))
+        },
+        recentPayments: recentPayments.map((payment) => serializeAdminPayment(payment)),
+        generatedAt: new Date()
+      }
     });
   } catch (error) {
     next(error);
