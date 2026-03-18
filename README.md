@@ -39,6 +39,11 @@ QR_TOKEN_VALIDITY_MINUTES=1
 MAX_FILE_SIZE=5242880
 UPLOAD_DIR=./uploads
 CLIENT_URL=http://localhost:3000
+FRONTEND_URL=http://localhost:3000
+MYFATOORAH_TOKEN=your-myfatoorah-token
+MYFATOORAH_BASE_URL=https://api-sa.myfatoorah.com
+MYFATOORAH_CALLBACK_BASE_URL=http://localhost:5000
+MYFATOORAH_PAYMENT_METHOD_ID=
 ```
 
 ### 3. Start MongoDB
@@ -136,6 +141,15 @@ Server will run on `http://localhost:5000`
 ### Dashboard Endpoint
 
 - `GET /api/dashboard/summary` - Get dashboard summary
+
+### Billing Endpoints
+
+- `GET /api/billing/plans` - List checkout-ready subscription plans
+- `POST /api/billing/checkout` - Create a MyFatoorah checkout session for the active organization
+- `GET /api/billing/status` - Get the organization subscription state and latest payment
+- `GET /api/billing/history` - Get organization payment history
+- `GET /api/billing/callback` - MyFatoorah success callback
+- `GET /api/billing/error` - MyFatoorah failure callback
 
 ## Project Structure
 
