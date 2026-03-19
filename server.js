@@ -7,12 +7,9 @@ const path = require('path');
 
 const connectDB = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
+const logger = require('./utils/logger');
 
-// Load env vars
 dotenv.config();
-
-// Connect to database
-connectDB();
 
 const app = express();
 
@@ -65,14 +62,11 @@ app.use(
 app.use(
   cors({
     origin: function (origin, callback) {
-      // allow requests with no origin like Postman/curl/mobile apps
       if (!origin) return callback(null, true);
 
       if (!allowedOrigins.includes(origin)) {
         return callback(
-          new Error(
-            'The CORS policy for this site does not allow access from the specified Origin.'
-          ),
+          new Error('The CORS policy for this site does not allow access from the specified Origin.'),
           false
         );
       }
@@ -155,7 +149,7 @@ app.use('/api/billing', require('./routes/billing'));
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({
+  res.status(200).json({
     success: true,
     message: 'atsha Server is running',
     timestamp: new Date().toISOString()
@@ -173,28 +167,55 @@ app.use((req, res) => {
   });
 });
 
-const logger = require('./utils/logger');
-
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || '0.0.0.0';
 
-const server = app.listen(PORT, HOST, () => {
-  logger.log(
-    `🚀 atsha Server running in ${process.env.NODE_ENV || 'development'} mode on ${HOST}:${PORT}`
-  );
-  logger.log('💡 QR codes will be generated on-demand from the frontend');
-});
+let server;
+
+const startServer = async () => {
+  try {
+    await connectDB();
+
+    server = app.listen(PORT, HOST, () => {
+      logger.log(
+        `🚀 atsha Server running in ${process.env.NODE_ENV || 'development'} mode on ${HOST}:${PORT}`
+      );
+      logger.log('💡 QR codes will be generated on-demand from the frontend');
+    });
+
+    server.on('error', (err) => {
+      logger.error(`Server error: ${err.message}`);
+      process.exit(1);
+    });
+  } catch (error) {
+    logger.error(`Failed to start server: ${error.message}`);
+    process.exit(1);
+  }
+};
+
+startServer();
 
 process.on('unhandledRejection', (err) => {
-  logger.error(`Error: ${err.message}`);
-  server.close(() => process.exit(1));
+  logger.error(`Unhandled Rejection: ${err.message}`);
+  if (server) {
+    server.close(() => process.exit(1));
+  } else {
+    process.exit(1);
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught Exception: ${err.message}`);
+  process.exit(1);
 });
 
 process.on('SIGTERM', () => {
   logger.log('SIGTERM received, shutting down gracefully...');
-  server.close(() => {
-    logger.log('Process terminated');
-  });
+  if (server) {
+    server.close(() => {
+      logger.log('Process terminated');
+    });
+  }
 });
 
 module.exports = app;
