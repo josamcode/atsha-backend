@@ -174,7 +174,7 @@ let server;
 
 const startServer = async () => {
   try {
-    await connectDB();
+    // await connectDB();
 
     server = app.listen(PORT, HOST, () => {
       logger.log(
