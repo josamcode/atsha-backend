@@ -7,8 +7,7 @@ const path = require('path');
 
 const connectDB = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
-console.log('Starting server...');
-// const logger = require('./utils/logger');
+const logger = require('./utils/logger');
 
 dotenv.config();
 
@@ -175,15 +174,13 @@ let server;
 
 const startServer = async () => {
   try {
-    // await connectDB();
+    await connectDB();
 
     server = app.listen(PORT, HOST, () => {
-      // logger.log(
-      console.log(
+      logger.log(
         `🚀 atsha Server running in ${process.env.NODE_ENV || 'development'} mode on ${HOST}:${PORT}`
       );
-      // logger.log('💡 QR codes will be generated on-demand from the frontend');
-      console.log('💡 QR codes will be generated on-demand from the frontend');
+      logger.log('💡 QR codes will be generated on-demand from the frontend');
     });
 
     server.on('error', (err) => {
@@ -213,12 +210,10 @@ process.on('uncaughtException', (err) => {
 });
 
 process.on('SIGTERM', () => {
-  // logger.log('SIGTERM received, shutting down gracefully...');
-  console.log('SIGTERM received, shutting down gracefully...');
+  logger.log('SIGTERM received, shutting down gracefully...');
   if (server) {
     server.close(() => {
-      // logger.log('Process terminated');
-      console.log('Process terminated');
+      logger.log('Process terminated');
     });
   }
 });
