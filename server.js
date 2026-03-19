@@ -23,7 +23,7 @@ app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 // Allowed origins
 const allowedOrigins =
   process.env.NODE_ENV === 'production'
-    ? ['https://ararm.vercel.app']
+    ? ['https://ararm.vercel.app', 'https://ararmsai']
     : [
       'http://localhost:3000',
       'http://192.168.56.1:3000',
@@ -176,10 +176,11 @@ app.use((req, res) => {
 const logger = require('./utils/logger');
 
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, HOST, () => {
   logger.log(
-    `🚀 atsha Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`
+    `🚀 atsha Server running in ${process.env.NODE_ENV || 'development'} mode on ${HOST}:${PORT}`
   );
   logger.log('💡 QR codes will be generated on-demand from the frontend');
 });
