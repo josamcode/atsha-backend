@@ -110,18 +110,47 @@ const mergeObject = (currentValue, patchValue) => ({
   ...(patchValue || {})
 });
 
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const toPlainObject = (value) => {
+  if (!isPlainObject(value)) {
+    return {};
+  }
+
+  const rawValue = typeof value.toObject === 'function'
+    ? value.toObject({ minimize: false })
+    : value;
+
+  return Object.entries(rawValue).reduce((result, [key, entryValue]) => {
+    if (entryValue !== undefined) {
+      result[key] = entryValue;
+    }
+
+    return result;
+  }, {});
+};
+
 const mergeSubscriptionConfig = (currentValue, patchValue) => {
+  const currentConfig = toPlainObject(currentValue);
+  const incomingConfig = toPlainObject(patchValue);
   const nextValue = {
-    ...(currentValue || {}),
-    ...(patchValue || {})
+    ...currentConfig,
+    ...incomingConfig
   };
 
   if (patchValue && Object.prototype.hasOwnProperty.call(patchValue, 'customLimits')) {
-    nextValue.customLimits = { ...(patchValue.customLimits || {}) };
+    nextValue.customLimits = toPlainObject(patchValue.customLimits);
   }
 
   if (patchValue && Object.prototype.hasOwnProperty.call(patchValue, 'customFeatures')) {
-    nextValue.customFeatures = { ...(patchValue.customFeatures || {}) };
+    nextValue.customFeatures = toPlainObject(patchValue.customFeatures);
+  }
+
+  if (patchValue && Object.prototype.hasOwnProperty.call(patchValue, 'market')) {
+    nextValue.market = {
+      ...toPlainObject(currentConfig.market),
+      ...toPlainObject(patchValue.market)
+    };
   }
 
   return nextValue;
