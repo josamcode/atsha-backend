@@ -613,11 +613,11 @@ exports.recordAttendance = async (req, res) => {
                 type: 'user_late',
                 title: {
                   en: 'Employee Late Arrival',
-                  ar: 'طھط£ط®ط± ظ…ظˆط¸ظپ'
+                  ar: 'تأخر موظف'
                 },
                 message: {
                   en: `${req.user.name} arrived ${lateMinutes} minute(s) late`,
-                  ar: `${req.user.name} ظˆطµظ„ ظ…طھط£ط®ط±ط§ظ‹ ${lateMinutes} ط¯ظ‚ظٹظ‚ط©`
+                  ar: `${req.user.name} وصل متأخراً ${lateMinutes} دقيقة`
                 },
                 data: {
                   userId: req.user.id,

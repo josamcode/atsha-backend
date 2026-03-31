@@ -18,6 +18,17 @@ const BRANDING_ASSET_FIELD_MAP = {
   watermark: 'watermarkUrl'
 };
 
+const EMAIL_NOTIFICATION_CATEGORY_KEYS = [
+  'users',
+  'invitations',
+  'forms',
+  'attendance',
+  'leaves',
+  'messages',
+  'organization',
+  'billing'
+];
+
 const titleizeDepartment = (value) => value
   .split(/[-_]/)
   .filter(Boolean)
@@ -198,6 +209,34 @@ const sanitizeSubscriptionPatch = (subscription) => {
   return Object.keys(patch).length > 0 ? patch : undefined;
 };
 
+const sanitizeEmailNotificationSettingsPatch = (settings) => {
+  if (!settings || typeof settings !== 'object') {
+    return undefined;
+  }
+
+  const patch = {};
+
+  if (settings.enabled !== undefined) {
+    patch.enabled = settings.enabled === true;
+  }
+
+  if (settings.categories && typeof settings.categories === 'object') {
+    const categories = EMAIL_NOTIFICATION_CATEGORY_KEYS.reduce((result, key) => {
+      if (settings.categories[key] !== undefined) {
+        result[key] = settings.categories[key] === true;
+      }
+
+      return result;
+    }, {});
+
+    if (Object.keys(categories).length > 0) {
+      patch.categories = categories;
+    }
+  }
+
+  return Object.keys(patch).length > 0 ? patch : undefined;
+};
+
 const sendControllerError = (res, error) => {
   if (error.code === 11000) {
     return res.status(400).json({
@@ -259,6 +298,7 @@ const buildPlatformOrganizationPatch = (body) => {
   if (body.securitySettings) patch.securitySettings = body.securitySettings;
   if (body.attendanceSettings) patch.attendanceSettings = body.attendanceSettings;
   if (body.leaveSettings) patch.leaveSettings = body.leaveSettings;
+  if (body.emailNotificationSettings) patch.emailNotificationSettings = sanitizeEmailNotificationSettingsPatch(body.emailNotificationSettings);
   if (body.featureFlags) patch.featureFlags = body.featureFlags;
   if (body.subscription) patch.subscription = sanitizeSubscriptionPatch(body.subscription);
 
@@ -288,6 +328,7 @@ const buildSettingsPatch = (body) => {
   if (body.securitySettings) patch.securitySettings = body.securitySettings;
   if (body.attendanceSettings) patch.attendanceSettings = body.attendanceSettings;
   if (body.leaveSettings) patch.leaveSettings = body.leaveSettings;
+  if (body.emailNotificationSettings) patch.emailNotificationSettings = sanitizeEmailNotificationSettingsPatch(body.emailNotificationSettings);
 
   return patch;
 };
@@ -347,7 +388,8 @@ exports.updateCurrentOrganizationSettings = async (req, res) => {
       branding: organization.branding,
       securitySettings: organization.securitySettings,
       attendanceSettings: organization.attendanceSettings,
-      leaveSettings: organization.leaveSettings
+      leaveSettings: organization.leaveSettings,
+      emailNotificationSettings: organization.emailNotificationSettings
     };
 
     if (patch.locale !== undefined) organization.locale = patch.locale;
@@ -358,6 +400,16 @@ exports.updateCurrentOrganizationSettings = async (req, res) => {
     if (patch.securitySettings) organization.securitySettings = mergeObject(organization.securitySettings, patch.securitySettings);
     if (patch.attendanceSettings) organization.attendanceSettings = mergeObject(organization.attendanceSettings, patch.attendanceSettings);
     if (patch.leaveSettings) organization.leaveSettings = mergeObject(organization.leaveSettings, patch.leaveSettings);
+    if (patch.emailNotificationSettings) {
+      organization.emailNotificationSettings = {
+        ...toPlainObject(organization.emailNotificationSettings),
+        ...patch.emailNotificationSettings,
+        categories: {
+          ...toPlainObject(organization.emailNotificationSettings?.categories),
+          ...toPlainObject(patch.emailNotificationSettings?.categories)
+        }
+      };
+    }
 
     await organization.save();
 

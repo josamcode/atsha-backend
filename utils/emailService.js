@@ -17,6 +17,21 @@ const devLog = (message, data = null) => {
   }
 };
 
+const EMAIL_LANGUAGE = 'ar';
+
+const normalizeEmailLanguage = () => EMAIL_LANGUAGE;
+
+const EMAIL_ROLE_LABELS = {
+  platform_admin: 'مدير المنصة',
+  organization_admin: 'مدير المنظمة',
+  admin: 'مدير',
+  supervisor: 'مشرف',
+  employee: 'موظف',
+  qr_manager: 'مسؤول QR'
+};
+
+const translateEmailRole = (role) => EMAIL_ROLE_LABELS[role] || role || '--';
+
 // Create transporter
 const createTransporter = () => {
   // Decode password if it's URL encoded (common when stored in env vars)
@@ -68,6 +83,7 @@ const createTransporter = () => {
 
 // Email template with company branding
 const getEmailTemplate = (title, content, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const direction = isRTL ? 'rtl' : 'ltr';
   const textAlign = isRTL ? 'right' : 'left';
@@ -334,19 +350,21 @@ const sendEmail = async ({ to, subject, html, text }) => {
 
 // Helper function to format dates for emails using Saudi timezone
 const formatEmailDate = (date, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const locale = language === 'ar' ? 'ar-SA' : 'en-US';
   return dateUtils.formatDate(date, { calendar: 'gregory' }, locale);
 };
 
 // Form submitted email
 const getFormSubmittedEmail = (formData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تم إرسال نموذج جديد' : 'New Form Submitted';
   const formTitle = isRTL ? formData.templateTitle?.ar : formData.templateTitle?.en;
-  const userName = formData.filledBy?.name || 'User';
-  const department = formData.department || 'N/A';
+  const userName = formData.filledBy?.name || 'مستخدم';
+  const department = formData.department || '--';
   const date = formatEmailDate(formData.date, language);
-  const shift = formData.shift || 'N/A';
+  const shift = formData.shift || '--';
 
   const content = `
     <h2>${title}</h2>
@@ -369,10 +387,11 @@ const getFormSubmittedEmail = (formData, language = 'en') => {
 
 // Form approved email
 const getFormApprovedEmail = (formData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تمت الموافقة على النموذج' : 'Form Approved';
   const formTitle = isRTL ? formData.templateTitle?.ar : formData.templateTitle?.en;
-  const approvedBy = formData.approvedBy?.name || 'Admin';
+  const approvedBy = formData.approvedBy?.name || 'المدير';
 
   const content = `
     <h2>${title}</h2>
@@ -393,10 +412,11 @@ const getFormApprovedEmail = (formData, language = 'en') => {
 
 // Form rejected email
 const getFormRejectedEmail = (formData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تم رفض النموذج' : 'Form Rejected';
   const formTitle = isRTL ? formData.templateTitle?.ar : formData.templateTitle?.en;
-  const rejectedBy = formData.rejectedBy?.name || 'Admin';
+  const rejectedBy = formData.rejectedBy?.name || 'المدير';
   const notes = formData.rejectionNotes || '';
 
   const content = `
@@ -419,14 +439,15 @@ const getFormRejectedEmail = (formData, language = 'en') => {
 
 // Leave requested email
 const getLeaveRequestedEmail = (leaveData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'طلب إجازة جديد' : 'New Leave Request';
-  const userName = leaveData.userName || 'User';
+  const userName = leaveData.userName || 'مستخدم';
   const leaveType = isRTL ? leaveData.leaveType?.ar : leaveData.leaveType?.en;
   const days = leaveData.days || 0;
   const startDate = formatEmailDate(leaveData.startDate, language);
   const endDate = formatEmailDate(leaveData.endDate, language);
-  const department = leaveData.department || 'N/A';
+  const department = leaveData.department || '--';
 
   // Calculate duration in hours if less than 1 day
   let durationText = '';
@@ -459,13 +480,14 @@ const getLeaveRequestedEmail = (leaveData, language = 'en') => {
 
 // Leave approved email
 const getLeaveApprovedEmail = (leaveData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تمت الموافقة على طلب الإجازة' : 'Leave Request Approved';
   const leaveType = isRTL ? leaveData.leaveType?.ar : leaveData.leaveType?.en;
   const days = leaveData.days || 0;
   const startDate = formatEmailDate(leaveData.startDate, language);
   const endDate = formatEmailDate(leaveData.endDate, language);
-  const approvedBy = leaveData.approvedBy?.name || 'Admin';
+  const approvedBy = leaveData.approvedBy?.name || 'المدير';
 
   // Calculate duration in hours if less than 1 day
   let durationText = '';
@@ -497,13 +519,14 @@ const getLeaveApprovedEmail = (leaveData, language = 'en') => {
 
 // Leave rejected email
 const getLeaveRejectedEmail = (leaveData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تم رفض طلب الإجازة' : 'Leave Request Rejected';
   const leaveType = isRTL ? leaveData.leaveType?.ar : leaveData.leaveType?.en;
   const days = leaveData.days || 0;
   const startDate = formatEmailDate(leaveData.startDate, language);
   const endDate = formatEmailDate(leaveData.endDate, language);
-  const rejectedBy = leaveData.rejectedBy?.name || 'Admin';
+  const rejectedBy = leaveData.rejectedBy?.name || 'المدير';
   const notes = leaveData.rejectionNotes || '';
 
   // Calculate duration in hours if less than 1 day
@@ -557,12 +580,12 @@ const sendEmailToAdmins = async (emailData, department = null, organizationId = 
       query.department = department;
     }
 
-    const admins = await User.find(query).select('email languagePreference');
+    const admins = await User.find(query).select('email');
 
     devLog('📋 Found admins', {
       count: admins.length,
       emails: admins.map(a => a.email),
-      languages: admins.map(a => a.languagePreference || 'ar')
+      language: EMAIL_LANGUAGE
     });
 
     if (admins.length === 0) {
@@ -573,7 +596,7 @@ const sendEmailToAdmins = async (emailData, department = null, organizationId = 
 
     const results = [];
     for (const admin of admins) {
-      const language = admin.languagePreference || 'ar';
+      const language = normalizeEmailLanguage();
       devLog(`📧 Preparing email for admin: ${admin.email}`, { language });
 
       const email = emailData(language);
@@ -610,6 +633,7 @@ const sendEmailToUser = async (userEmail, emailData, language = 'ar') => {
   try {
     devLog('👤 Sending email to user', { userEmail, language });
 
+    language = normalizeEmailLanguage(language);
     const email = emailData(language);
 
     devLog('📧 Email prepared for user', {
@@ -640,11 +664,12 @@ const sendEmailToUser = async (userEmail, emailData, language = 'ar') => {
 
 // Password reset email
 const getPasswordResetEmail = (resetData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'إعادة تعيين كلمة المرور' : 'Password Reset';
   const resetLink = resetData.resetLink;
-  const userName = resetData.userName || 'User';
-  const expiresIn = resetData.expiresIn || '1 hour';
+  const userName = resetData.userName || 'مستخدم';
+  const expiresIn = resetData.expiresIn || 'ساعة واحدة';
 
   const content = `
     <h2>${title}</h2>
@@ -674,11 +699,12 @@ const getPasswordResetEmail = (resetData, language = 'en') => {
 };
 
 const getOrganizationRegistrationVerificationEmail = (verificationData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تأكيد بريد المؤسسة' : 'Verify Your Organization Email';
   const code = verificationData.code || '000000';
-  const organizationName = verificationData.organizationName || (isRTL ? 'مؤسستك' : 'your organization');
-  const expiresIn = verificationData.expiresIn || '10 minutes';
+  const organizationName = verificationData.organizationName || 'مؤسستك';
+  const expiresIn = verificationData.expiresIn || '10 دقائق';
 
   const content = `
     <h2>${title}</h2>
@@ -709,11 +735,12 @@ const getOrganizationRegistrationVerificationEmail = (verificationData, language
 
 // Password reset request email (to admins)
 const getPasswordResetRequestEmail = (requestData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'طلب إعادة تعيين كلمة المرور' : 'Password Reset Request';
-  const userName = requestData.userName || 'User';
-  const userEmail = requestData.userEmail || 'N/A';
-  const department = requestData.department || 'N/A';
+  const userName = requestData.userName || 'مستخدم';
+  const userEmail = requestData.userEmail || '--';
+  const department = requestData.department || '--';
   const requestDate = formatEmailDate(requestData.requestDate, language);
 
   const content = `
@@ -736,11 +763,12 @@ const getPasswordResetRequestEmail = (requestData, language = 'en') => {
 
 // Password reset by admin email
 const getPasswordResetByAdminEmail = (resetData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تم إعادة تعيين كلمة المرور' : 'Password Has Been Reset';
-  const userName = resetData.userName || 'User';
+  const userName = resetData.userName || 'مستخدم';
   const newPassword = resetData.newPassword || '';
-  const resetBy = resetData.resetBy || 'Admin';
+  const resetBy = resetData.resetBy || 'المدير';
 
   const content = `
     <h2>${title}</h2>
@@ -764,12 +792,13 @@ const getPasswordResetByAdminEmail = (resetData, language = 'en') => {
 
 // Invitation email
 const getInvitationEmail = (invitationData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'دعوة للانضمام إلى المؤسسة' : 'Invitation To Join Organization';
-  const organizationName = invitationData.organizationName || 'Organization';
-  const inviterName = invitationData.inviterName || 'Administrator';
-  const role = invitationData.role || 'employee';
-  const department = invitationData.department || 'other';
+  const organizationName = invitationData.organizationName || 'المؤسسة';
+  const inviterName = invitationData.inviterName || 'المدير';
+  const role = translateEmailRole(invitationData.role || 'employee');
+  const department = invitationData.department || 'أخرى';
   const inviteLink = invitationData.inviteLink;
   const expiresAt = invitationData.expiresAt ? formatEmailDate(invitationData.expiresAt, language) : null;
 
@@ -801,6 +830,7 @@ const getInvitationEmail = (invitationData, language = 'en') => {
 
 // Employee report email
 const getEmployeeReportEmail = (data, language = 'en') => {
+  language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
   const title = isRTL ? 'تقرير الأداء الشهري' : 'Monthly Performance Report';
   const content = `

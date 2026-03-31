@@ -1103,23 +1103,23 @@ exports.sendEmployeeReport = async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const organizationQuery = organization.slug ? `&organization=${organization.slug}` : '';
     const reportUrl = `${frontendUrl}/users/${employee._id}/report?month=${selectedMonth}&year=${selectedYear}${organizationQuery}`;
-    const language = employee.languagePreference || 'ar';
-    const organizationName = organization.branding?.displayName || organization.name || 'Organization';
+    const emailLanguage = 'ar';
+    const organizationName = organization.branding?.displayName || organization.name || 'المؤسسة';
 
     const emailData = getEmployeeReportEmail({
       employeeName: employee.name,
-      month: language === 'ar' ? MONTH_NAMES_AR[selectedMonth] : MONTH_NAMES[selectedMonth],
+      month: MONTH_NAMES_AR[selectedMonth],
       year: selectedYear,
-      department: getDepartmentDisplayName(organization, employee.department, language),
+      department: getDepartmentDisplayName(organization, employee.department, emailLanguage),
       reportUrl
-    }, language);
+    }, emailLanguage);
 
     const emailContent = emailData.html.replace(
       /<p style="text-align: [^"]+; font-size: 12px; color: #6b7280;">[^<]+<\/p>/,
       `<div style="text-align: center; margin: 30px 0;">
-        <a href="${reportUrl}" style="display: inline-block; padding: 12px 25px; background-color: #d4b900; color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold;">${language === 'ar' ? 'عرض التقرير' : 'View Report'}</a>
+        <a href="${reportUrl}" style="display: inline-block; padding: 12px 25px; background-color: #d4b900; color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold;">عرض التقرير</a>
       </div>
-      <p style="text-align: ${language === 'ar' ? 'right' : 'left'}; font-size: 12px; color: #6b7280;">${organizationName} ${language === 'ar' ? 'فريق الإدارة' : 'Management Team'}</p>`
+      <p style="text-align: right; font-size: 12px; color: #6b7280;">${organizationName} فريق الإدارة</p>`
     );
 
     const result = await sendEmailToUser(
@@ -1128,7 +1128,7 @@ exports.sendEmployeeReport = async (req, res) => {
         subject: emailData.subject,
         html: emailContent
       }),
-      language
+      emailLanguage
     );
 
     if (!result.success) {

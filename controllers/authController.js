@@ -610,7 +610,7 @@ exports.sendOrganizationRegistrationVerificationCode = async (req, res) => {
       normalizedEmail,
       (language) => getOrganizationRegistrationVerificationEmail({
         code: verificationCode,
-        organizationName: organizationName || (language === 'ar' ? 'مؤسستك' : 'your organization'),
+        organizationName: organizationName || 'مؤسستك',
         expiresIn: buildOrganizationVerificationExpiryLabel(language)
       }, language),
       preferredLanguage
@@ -1207,7 +1207,7 @@ exports.forgotPassword = async (req, res) => {
       await sendEmailToUser(user.email, (language) => getPasswordResetEmail({
         resetLink: resetUrl,
         userName: user.name,
-        expiresIn: '1 hour'
+        expiresIn: 'ساعة واحدة'
       }, language), userLanguage);
     }
 

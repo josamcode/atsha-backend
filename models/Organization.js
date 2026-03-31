@@ -27,6 +27,17 @@ const buildDefaultDepartments = () => LEGACY_DEPARTMENTS.map((code, index) => ({
   isDefault: code === 'other'
 }));
 
+const buildDefaultEmailNotificationCategories = () => ({
+  users: true,
+  invitations: true,
+  forms: true,
+  attendance: true,
+  leaves: true,
+  messages: true,
+  organization: true,
+  billing: true
+});
+
 const departmentSchema = new mongoose.Schema({
   code: {
     type: String,
@@ -255,6 +266,46 @@ const organizationSchema = new mongoose.Schema({
       default: 0
     }
   },
+  emailNotificationSettings: {
+    enabled: {
+      type: Boolean,
+      default: true
+    },
+    categories: {
+      users: {
+        type: Boolean,
+        default: true
+      },
+      invitations: {
+        type: Boolean,
+        default: true
+      },
+      forms: {
+        type: Boolean,
+        default: true
+      },
+      attendance: {
+        type: Boolean,
+        default: true
+      },
+      leaves: {
+        type: Boolean,
+        default: true
+      },
+      messages: {
+        type: Boolean,
+        default: true
+      },
+      organization: {
+        type: Boolean,
+        default: true
+      },
+      billing: {
+        type: Boolean,
+        default: true
+      }
+    }
+  },
   featureFlags: {
     multiOrganization: {
       type: Boolean,
@@ -316,6 +367,21 @@ organizationSchema.pre('validate', function (next) {
 
   if (!this.subscription || typeof this.subscription !== 'object') {
     this.subscription = {};
+  }
+
+  if (!this.emailNotificationSettings || typeof this.emailNotificationSettings !== 'object') {
+    this.emailNotificationSettings = {
+      enabled: true,
+      categories: buildDefaultEmailNotificationCategories()
+    };
+  } else {
+    this.emailNotificationSettings = {
+      enabled: this.emailNotificationSettings.enabled !== false,
+      categories: {
+        ...buildDefaultEmailNotificationCategories(),
+        ...(this.emailNotificationSettings.categories || {})
+      }
+    };
   }
 
   if (this.plan) {

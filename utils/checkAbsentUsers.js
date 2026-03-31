@@ -72,11 +72,11 @@ const checkAbsentUsers = async ({ organizationId = null } = {}) => {
         type: 'user_absent',
         title: {
           en: 'Employee Absent',
-          ar: 'ط؛ظٹط§ط¨ ظ…ظˆط¸ظپ'
+          ar: 'غياب موظف'
         },
         message: {
           en: `${user.name} did not check in today`,
-          ar: `${user.name} ظ„ظ… ظٹط³ط¬ظ„ ط§ظ„ط­ط¶ظˆط± ط§ظ„ظٹظˆظ…`
+          ar: `${user.name} لم يسجل الحضور اليوم`
         },
         data: {
           userId: user._id,

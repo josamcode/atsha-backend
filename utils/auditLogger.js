@@ -1,4 +1,5 @@
 const AuditLog = require('../models/AuditLog');
+const { sendOrganizationAdminAuditEmails } = require('./auditEmailNotifications');
 
 const getRequestIp = (req) => {
   const forwarded = req?.headers?.['x-forwarded-for'];
@@ -26,7 +27,7 @@ const createAuditLog = async ({
       return null;
     }
 
-    return await AuditLog.create({
+    const auditLog = await AuditLog.create({
       organizationId: organizationId || req?.organization?._id || req?.user?.organizationId || null,
       actorUserId,
       action,
@@ -36,6 +37,12 @@ const createAuditLog = async ({
       ip: getRequestIp(req),
       userAgent: getUserAgent(req)
     });
+
+    sendOrganizationAdminAuditEmails({ auditLog, req }).catch((error) => {
+      console.error('Failed to queue organization admin audit email:', error);
+    });
+
+    return auditLog;
   } catch (error) {
     console.error('Failed to write audit log:', error);
     return null;

@@ -10,6 +10,7 @@ const {
   incrementMonthlyUsage
 } = require('../utils/subscription');
 const { normalizeRole } = require('../utils/tenantConstants');
+const { createAuditLog } = require('../utils/auditLogger');
 
 const MESSAGE_POPULATE = [
   {
@@ -376,6 +377,18 @@ exports.sendMessage = async (req, res) => {
           metric: 'messagesPerMonth',
           amount: createdMessages.length
         });
+
+        await createAuditLog({
+          req,
+          organizationId: organization._id,
+          actorUserId: req.user._id,
+          action: 'message.broadcast_sent',
+          entityType: 'Message',
+          metadata: {
+            recipientCount: createdMessages.length,
+            subject
+          }
+        });
       }
 
       return res.status(201).json({
@@ -439,6 +452,20 @@ exports.sendMessage = async (req, res) => {
         organizationId: organization._id,
         metric: 'messagesPerMonth',
         amount: 1
+      });
+
+      await createAuditLog({
+        req,
+        organizationId: organization._id,
+        actorUserId: req.user._id,
+        action: 'message.sent',
+        entityType: 'Message',
+        entityId: message._id,
+        metadata: {
+          recipientId: recipientUser._id,
+          recipientName: recipientUser.name || null,
+          subject
+        }
       });
     }
 
@@ -532,6 +559,18 @@ exports.deleteMessage = async (req, res) => {
     }
 
     await message.deleteOne();
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'message.deleted',
+      entityType: 'Message',
+      entityId: message._id,
+      metadata: {
+        subject: message.subject || null
+      }
+    });
 
     res.json({
       success: true,

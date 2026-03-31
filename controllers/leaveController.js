@@ -46,12 +46,12 @@ const SELF_ONLY_LEAVE_ROLES = new Set([
 ]);
 
 const LEAVE_TYPE_LABELS = {
-  vacation: { en: 'Vacation', ar: 'ط¥ط¬ط§ط²ط©' },
-  sick: { en: 'Sick', ar: 'ظ…ط±ط¶ظٹط©' },
-  permission: { en: 'Permission', ar: 'ط¥ط°ظ†' },
-  emergency: { en: 'Emergency', ar: 'ط·ط§ط±ط¦' },
-  unpaid: { en: 'Unpaid', ar: 'ط¨ط¯ظˆظ† ط±ط§طھط¨' },
-  other: { en: 'Other', ar: 'ط£ط®ط±ظ‰' }
+  vacation: { en: 'Vacation', ar: 'إجازة' },
+  sick: { en: 'Sick', ar: 'مرضية' },
+  permission: { en: 'Permission', ar: 'إذن' },
+  emergency: { en: 'Emergency', ar: 'طارئ' },
+  unpaid: { en: 'Unpaid', ar: 'بدون راتب' },
+  other: { en: 'Other', ar: 'أخرى' }
 };
 
 const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
@@ -373,11 +373,11 @@ exports.createLeaveRequest = async (req, res) => {
       type: 'leave_requested',
       title: {
         en: 'New Leave Request',
-        ar: 'ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ط¬ط¯ظٹط¯'
+        ar: 'طلب إجازة جديد'
       },
       message: {
         en: `${userName} requested ${calculatedDays} day(s) of ${leaveLabels.en} leave`,
-        ar: `${userName} ط·ظ„ط¨ ${calculatedDays} ظٹظˆظ… ظ…ظ† ط¥ط¬ط§ط²ط© ${leaveLabels.ar}`
+        ar: `${userName} طلب ${calculatedDays} يوم من إجازة ${leaveLabels.ar}`
       },
       data: {
         leaveId: leave._id,
@@ -649,14 +649,14 @@ exports.approveLeaveRequest = async (req, res) => {
       title: {
         en: `Leave Request ${action === 'approved' ? 'Approved' : 'Rejected'}`,
         ar: action === 'approved'
-          ? 'طھظ… ط§ظ„ظ…ظˆط§ظپظ‚ط© ط¹ظ„ظ‰ ط·ظ„ط¨ ط§ظ„ط¥ط¬ط§ط²ط©'
-          : 'طھظ… ط±ظپط¶ ط·ظ„ط¨ ط§ظ„ط¥ط¬ط§ط²ط©'
+          ? 'تمت الموافقة على طلب الإجازة'
+          : 'تم رفض طلب الإجازة'
       },
       message: {
         en: `Leave request from ${userName} (${leave.days} day(s) ${leaveLabels.en}) has been ${action}`,
         ar: action === 'approved'
-          ? `طھظ… ط§ظ„ظ…ظˆط§ظپظ‚ط© ط¹ظ„ظ‰ ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ظ…ظ† ${userName} (${leave.days} ظٹظˆظ… ${leaveLabels.ar})`
-          : `طھظ… ط±ظپط¶ ط·ظ„ط¨ ط¥ط¬ط§ط²ط© ظ…ظ† ${userName} (${leave.days} ظٹظˆظ… ${leaveLabels.ar})`
+          ? `تمت الموافقة على طلب إجازة من ${userName} (${leave.days} يوم ${leaveLabels.ar})`
+          : `تم رفض طلب إجازة من ${userName} (${leave.days} يوم ${leaveLabels.ar})`
       },
       data: {
         leaveId: leave._id,
