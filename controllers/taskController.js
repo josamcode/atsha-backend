@@ -3,6 +3,7 @@ const User = require('../models/User');
 const { createNotification } = require('../utils/notifications');
 const {
   sendEmailToUser,
+  getTaskAssignedEmail,
   getTaskAcceptedEmail,
   getTaskRejectedEmail,
   getTaskCompletedEmail
@@ -124,22 +125,22 @@ const buildTaskCompletedNotification = (task) => ({
 const buildTaskAcceptedNotification = (task) => ({
   title: {
     en: 'Task Accepted',
-    ar: 'طھظ… ظ‚ط¨ظˆظ„ ط§ظ„ظ…ظ‡ظ…ط©'
+    ar: 'تم قبول المهمة'
   },
   message: {
     en: `${task.assignedTo?.name || 'Employee'} accepted "${task.title}"`,
-    ar: `${task.assignedTo?.name || 'ط§ظ„ظ…ظˆط¸ظپ'} ظ‚ط¨ظ„ ط§ظ„ظ…ظ‡ظ…ط© "${task.title}"`
+    ar: `${task.assignedTo?.name || 'الموظف'} قبل المهمة "${task.title}"`
   }
 });
 
 const buildTaskRejectedNotification = (task) => ({
   title: {
     en: 'Task Rejected',
-    ar: 'طھظ… ط±ظپط¶ ط§ظ„ظ…ظ‡ظ…ط©'
+    ar: 'تم رفض المهمة'
   },
   message: {
     en: `${task.assignedTo?.name || 'Employee'} rejected "${task.title}"`,
-    ar: `${task.assignedTo?.name || 'ط§ظ„ظ…ظˆط¸ظپ'} ط±ظپط¶ ط§ظ„ظ…ظ‡ظ…ط© "${task.title}"`
+    ar: `${task.assignedTo?.name || 'الموظف'} رفض المهمة "${task.title}"`
   }
 });
 
@@ -257,6 +258,18 @@ exports.createTask = async (req, res) => {
       }
     });
 
+    if (task.assignedTo?.email) {
+      await sendEmailToUser(
+        task.assignedTo.email,
+        (language) => getTaskAssignedEmail({
+          taskTitle: task.title,
+          adminName: task.assignedBy?.name,
+          dueDate: task.dueDate,
+          details: task.details
+        }, language)
+      );
+    }
+
     res.status(201).json({
       success: true,
       data: task
@@ -323,7 +336,7 @@ exports.respondToTask = async (req, res) => {
         task.assignedBy.email,
         (language) => taskResponseEmail({
           taskTitle: task.title,
-          employeeName: task.assignedTo?.name || 'Employee',
+          employeeName: task.assignedTo?.name,
           dueDate: task.dueDate,
           notes: task.responseNotes
         }, language)
@@ -393,7 +406,7 @@ exports.completeTask = async (req, res) => {
         task.assignedBy.email,
         (language) => getTaskCompletedEmail({
           taskTitle: task.title,
-          employeeName: task.assignedTo?.name || 'Employee',
+          employeeName: task.assignedTo?.name,
           dueDate: task.dueDate,
           completedAt: task.completedAt,
           notes: task.completionNotes

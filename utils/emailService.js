@@ -558,6 +558,37 @@ const getLeaveRejectedEmail = (leaveData, language = 'en') => {
   };
 };
 
+const getTaskAssignedEmail = (taskData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'تم إسناد مهمة جديدة إليك' : 'New Task Assigned';
+  const adminName = taskData.adminName || (isRTL ? 'المدير' : 'Admin');
+  const taskTitle = taskData.taskTitle || (isRTL ? 'مهمة جديدة' : 'New Task');
+  const dueDate = taskData.dueDate ? formatEmailDate(taskData.dueDate, language) : null;
+  const details = taskData.details || '';
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL
+      ? `${adminName} قام بإسناد المهمة "${taskTitle}" إليك.`
+      : `${adminName} assigned the task "${taskTitle}" to you.`}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'المهمة:' : 'Task:'}</strong> ${taskTitle}</p>
+      <p><strong>${isRTL ? 'أُسندت بواسطة:' : 'Assigned By:'}</strong> ${adminName}</p>
+      ${dueDate ? `<p><strong>${isRTL ? 'تاريخ الاستحقاق:' : 'Due Date:'}</strong> ${dueDate}</p>` : ''}
+      ${details ? `<p><strong>${isRTL ? 'التفاصيل:' : 'Details:'}</strong> ${details}</p>` : ''}
+    </div>
+    <p>${isRTL
+      ? 'يرجى مراجعة المهمة من صفحة المهام ثم قبولها أو رفضها مع الملاحظات عند الحاجة.'
+      : 'Please review the task from the tasks page, then accept or reject it with notes when needed.'}</p>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
 const getTaskAcceptedEmail = (taskData, language = 'en') => {
   language = normalizeEmailLanguage(language);
   const isRTL = language === 'ar';
@@ -946,6 +977,7 @@ module.exports = {
   getLeaveRequestedEmail,
   getLeaveApprovedEmail,
   getLeaveRejectedEmail,
+  getTaskAssignedEmail,
   getTaskAcceptedEmail,
   getTaskRejectedEmail,
   getTaskCompletedEmail,
