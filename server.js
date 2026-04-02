@@ -141,6 +141,7 @@ app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/leaves', require('./routes/leaves'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/tasks', require('./routes/tasks'));
 app.use('/api/messages', require('./routes/messages'));
 app.use('/api/organizations', require('./routes/organizations'));
 app.use('/api/invitations', require('./routes/invitations'));
@@ -182,6 +183,7 @@ const startServer = async () => {
       );
       logger.log('💡 QR codes will be generated on-demand from the frontend');
     });
+
 
     server.on('error', (err) => {
       logger.error(`Server error: ${err.message}`);

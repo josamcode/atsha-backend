@@ -1,6 +1,7 @@
 const Notification = require('../models/Notification');
 const { buildTenantQuery } = require('../utils/tenantScope');
 const { resolveScopedOrganization } = require('../utils/formAccess');
+const { syncOverdueTasksForOrganization } = require('../utils/taskStatusSync');
 
 const sendControllerError = (res, error) => res.status(error.statusCode || 500).json({
   success: false,
@@ -28,6 +29,7 @@ const resolveNotificationOrganization = async (req, fallbackOrganizationId = nul
 exports.getNotifications = async (req, res) => {
   try {
     const organization = await resolveNotificationOrganization(req);
+    await syncOverdueTasksForOrganization(organization);
     const { read, limit = 50, page = 1 } = req.query;
     const pagination = parsePagination(page, limit);
     const query = buildTenantQuery(organization, { recipient: req.user.id });
@@ -71,6 +73,7 @@ exports.getNotifications = async (req, res) => {
 exports.getUnreadCount = async (req, res) => {
   try {
     const organization = await resolveNotificationOrganization(req);
+    await syncOverdueTasksForOrganization(organization);
     const count = await Notification.countDocuments(buildTenantQuery(organization, {
       recipient: req.user.id,
       read: false

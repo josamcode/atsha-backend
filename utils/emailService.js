@@ -558,6 +558,92 @@ const getLeaveRejectedEmail = (leaveData, language = 'en') => {
   };
 };
 
+const getTaskAcceptedEmail = (taskData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'تم قبول المهمة' : 'Task Accepted';
+  const employeeName = taskData.employeeName || (isRTL ? 'الموظف' : 'Employee');
+  const taskTitle = taskData.taskTitle || (isRTL ? 'مهمة جديدة' : 'New Task');
+  const dueDate = taskData.dueDate ? formatEmailDate(taskData.dueDate, language) : null;
+  const notes = taskData.notes || '';
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL
+      ? `${employeeName} قام بقبول المهمة "${taskTitle}".`
+      : `${employeeName} accepted the task "${taskTitle}".`}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'الموظف:' : 'Employee:'}</strong> ${employeeName}</p>
+      <p><strong>${isRTL ? 'المهمة:' : 'Task:'}</strong> ${taskTitle}</p>
+      ${dueDate ? `<p><strong>${isRTL ? 'تاريخ الاستحقاق:' : 'Due Date:'}</strong> ${dueDate}</p>` : ''}
+      ${notes ? `<p><strong>${isRTL ? 'ملاحظات:' : 'Notes:'}</strong> ${notes}</p>` : ''}
+    </div>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
+const getTaskRejectedEmail = (taskData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'تم رفض المهمة' : 'Task Rejected';
+  const employeeName = taskData.employeeName || (isRTL ? 'الموظف' : 'Employee');
+  const taskTitle = taskData.taskTitle || (isRTL ? 'مهمة جديدة' : 'New Task');
+  const dueDate = taskData.dueDate ? formatEmailDate(taskData.dueDate, language) : null;
+  const notes = taskData.notes || '';
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL
+      ? `${employeeName} رفض المهمة "${taskTitle}".`
+      : `${employeeName} rejected the task "${taskTitle}".`}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'الموظف:' : 'Employee:'}</strong> ${employeeName}</p>
+      <p><strong>${isRTL ? 'المهمة:' : 'Task:'}</strong> ${taskTitle}</p>
+      ${dueDate ? `<p><strong>${isRTL ? 'تاريخ الاستحقاق:' : 'Due Date:'}</strong> ${dueDate}</p>` : ''}
+      ${notes ? `<p><strong>${isRTL ? 'سبب الرفض:' : 'Rejection Notes:'}</strong> ${notes}</p>` : ''}
+    </div>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
+const getTaskCompletedEmail = (taskData, language = 'en') => {
+  language = normalizeEmailLanguage(language);
+  const isRTL = language === 'ar';
+  const title = isRTL ? 'تم إنجاز المهمة' : 'Task Completed';
+  const employeeName = taskData.employeeName || (isRTL ? 'الموظف' : 'Employee');
+  const taskTitle = taskData.taskTitle || (isRTL ? 'مهمة جديدة' : 'New Task');
+  const dueDate = taskData.dueDate ? formatEmailDate(taskData.dueDate, language) : null;
+  const completedAt = taskData.completedAt ? formatEmailDate(taskData.completedAt, language) : null;
+  const notes = taskData.notes || '';
+
+  const content = `
+    <h2>${title}</h2>
+    <p>${isRTL
+      ? `${employeeName} أنهى المهمة "${taskTitle}".`
+      : `${employeeName} completed the task "${taskTitle}".`}</p>
+    <div class="info-box">
+      <p><strong>${isRTL ? 'الموظف:' : 'Employee:'}</strong> ${employeeName}</p>
+      <p><strong>${isRTL ? 'المهمة:' : 'Task:'}</strong> ${taskTitle}</p>
+      ${dueDate ? `<p><strong>${isRTL ? 'تاريخ الاستحقاق:' : 'Due Date:'}</strong> ${dueDate}</p>` : ''}
+      ${completedAt ? `<p><strong>${isRTL ? 'وقت الإنجاز:' : 'Completed At:'}</strong> ${completedAt}</p>` : ''}
+      ${notes ? `<p><strong>${isRTL ? 'ملاحظات الإنجاز:' : 'Completion Notes:'}</strong> ${notes}</p>` : ''}
+    </div>
+  `;
+
+  return {
+    subject: title,
+    html: getEmailTemplate(title, content, language)
+  };
+};
+
 // Send email to admins
 const sendEmailToAdmins = async (emailData, department = null, organizationId = null) => {
   try {
@@ -860,6 +946,9 @@ module.exports = {
   getLeaveRequestedEmail,
   getLeaveApprovedEmail,
   getLeaveRejectedEmail,
+  getTaskAcceptedEmail,
+  getTaskRejectedEmail,
+  getTaskCompletedEmail,
   getPasswordResetEmail,
   getOrganizationRegistrationVerificationEmail,
   getPasswordResetRequestEmail,
