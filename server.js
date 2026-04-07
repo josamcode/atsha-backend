@@ -20,7 +20,7 @@ app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 // Allowed origins
 const allowedOrigins =
   process.env.NODE_ENV === 'production'
-    ? ['https://ararm.vercel.app', 'https://ararmsai.com', 'https://www.ararmsai.com']
+    ? ['https://ararm.vercel.app', 'https://ararmsai.com', 'https://www.ararmsai.com', 'https://localhost']
     : [
       'http://localhost:3000',
       'http://192.168.56.1:3000',
