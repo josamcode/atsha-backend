@@ -1,4 +1,5 @@
 const Organization = require('../models/Organization');
+const PlatformConfig = require('../models/PlatformConfig');
 const User = require('../models/User');
 const Invitation = require('../models/Invitation');
 const FormInstance = require('../models/FormInstance');
@@ -6,6 +7,7 @@ const { createAuditLog } = require('../utils/auditLogger');
 const { deleteStoredAsset, uploadOrganizationBrandingAsset } = require('../utils/mediaStorage');
 const { resolveManagedOrganization } = require('../utils/organizationAccess');
 const { formatOrganizationForClient } = require('../utils/organizationFormatter');
+const { DEFAULT_PLATFORM_PROFILE } = require('../utils/platformDefaults');
 const {
   getOrganizationPlanQueryValues,
   normalizeDepartmentCode,
@@ -28,6 +30,7 @@ const EMAIL_NOTIFICATION_CATEGORY_KEYS = [
   'organization',
   'billing'
 ];
+const ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT = 3;
 
 const titleizeDepartment = (value) => value
   .split(/[-_]/)
@@ -256,6 +259,133 @@ const sendControllerError = (res, error) => {
     success: false,
     message: error.message
   });
+};
+
+const normalizeEmailValue = (value = '') => String(value || '').trim().toLowerCase();
+
+const getPlatformRegistrationProfile = async () => {
+  const config = await PlatformConfig.findOne({ key: 'global' })
+    .select('profile')
+    .lean();
+
+  return {
+    ...DEFAULT_PLATFORM_PROFILE,
+    ...(config?.profile || {})
+  };
+};
+
+const slugifyOrganizationName = (value = '') => String(value || '')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '') || 'organization';
+
+const resolveAvailableOrganizationSlug = async (organizationName, preferredSlug) => {
+  const baseSlug = slugifyOrganizationName(preferredSlug || organizationName);
+  let candidateSlug = baseSlug;
+  let counter = 2;
+
+  while (await Organization.exists({ slug: candidateSlug })) {
+    candidateSlug = `${baseSlug}-${counter}`;
+    counter += 1;
+  }
+
+  return candidateSlug;
+};
+
+const getDuplicateKeyFields = (error) => {
+  if (error?.keyPattern && typeof error.keyPattern === 'object') {
+    return Object.keys(error.keyPattern);
+  }
+
+  if (error?.keyValue && typeof error.keyValue === 'object') {
+    return Object.keys(error.keyValue);
+  }
+
+  const match = String(error?.message || '').match(/index:\s+([a-zA-Z0-9_]+)_1/);
+  return match ? [match[1]] : [];
+};
+
+const isDuplicateKeyForField = (error, field) => (
+  error?.code === 11000 && getDuplicateKeyFields(error).includes(field)
+);
+
+const buildOrganizationAccountPayload = async ({ organizationName, organizationSlug, email }) => {
+  const platformProfile = await getPlatformRegistrationProfile();
+  const defaultPlanCode = platformProfile.defaultOrganizationPlan || 'free';
+  const normalizedOrganizationName = String(organizationName || '').trim();
+
+  return {
+    name: normalizedOrganizationName,
+    slug: await resolveAvailableOrganizationSlug(normalizedOrganizationName, organizationSlug),
+    status: 'active',
+    plan: defaultPlanCode,
+    subscription: {
+      planCode: defaultPlanCode,
+      status: 'active',
+      billingCycle: 'monthly',
+      startsAt: new Date(),
+      downgradePlanCode: 'free',
+      market: {
+        primaryRegion: 'MENA',
+        primaryCountry: 'SA',
+        currency: 'SAR'
+      }
+    },
+    locale: platformProfile.locale || 'en',
+    timezone: platformProfile.timezone || 'Africa/Cairo',
+    branding: {
+      displayName: normalizedOrganizationName,
+      shortName: normalizedOrganizationName,
+      legalName: normalizedOrganizationName,
+      supportEmail: normalizeEmailValue(email),
+      emailFromName: normalizedOrganizationName
+    }
+  };
+};
+
+const createOrganizationAccountWithSlugRetry = async ({ organizationName, organizationSlug, email }) => {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await Organization.create(
+        await buildOrganizationAccountPayload({
+          organizationName,
+          organizationSlug,
+          email
+        })
+      );
+    } catch (error) {
+      lastError = error;
+
+      if (!isDuplicateKeyForField(error, 'slug') || attempt === ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT - 1) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
+};
+
+const getOrganizationAccountErrorMessage = (error) => {
+  if (error?.name === 'ValidationError') {
+    return Object.values(error.errors).map((entry) => entry.message).join(', ');
+  }
+
+  if (error?.code === 11000) {
+    if (isDuplicateKeyForField(error, 'slug')) {
+      return 'Organization slug already exists';
+    }
+
+    if (isDuplicateKeyForField(error, 'email')) {
+      return 'Email already exists';
+    }
+
+    return 'Duplicate field value entered';
+  }
+
+  return error.message;
 };
 
 const getOrganizationSummary = async (organizationId) => {
@@ -653,6 +783,120 @@ exports.createOrganization = async (req, res) => {
     });
   } catch (error) {
     sendControllerError(res, error);
+  }
+};
+
+// @desc    Create organization with its first admin account
+// @route   POST /api/organizations/account
+// @access  Private (Platform Admin)
+exports.createOrganizationAccount = async (req, res) => {
+  let organization = null;
+  let createdUser = null;
+
+  try {
+    const {
+      organizationName,
+      organizationSlug,
+      name,
+      email,
+      password,
+      phone,
+      languagePreference
+    } = req.body;
+
+    if (!organizationName || !name || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide organization name, admin name, email, and password'
+      });
+    }
+
+    if (String(password).length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters'
+      });
+    }
+
+    organization = await createOrganizationAccountWithSlugRetry({
+      organizationName,
+      organizationSlug,
+      email
+    });
+
+    createdUser = await User.create({
+      organizationId: organization._id,
+      name: String(name || '').trim(),
+      email: normalizeEmailValue(email),
+      password,
+      phone: phone || undefined,
+      role: 'organization_admin',
+      department: 'management',
+      departments: [],
+      languagePreference: languagePreference || organization.locale || 'en',
+      leaveBalance: organization.leaveSettings?.defaultAnnualBalance || 0
+    });
+
+    organization.createdBy = createdUser._id;
+    await organization.save();
+
+    try {
+      await createAuditLog({
+        req,
+        organizationId: organization._id,
+        actorUserId: req.user._id,
+        action: 'organization.account_created',
+        entityType: 'Organization',
+        entityId: organization._id,
+        metadata: {
+          name: organization.name,
+          slug: organization.slug,
+          adminUserId: createdUser._id,
+          adminEmail: createdUser.email
+        }
+      });
+    } catch (auditError) {
+      console.error('Error creating organization account audit log:', auditError);
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        organization: await formatOrganization(organization, {
+          includeUsage: true,
+          summary: await getOrganizationSummary(organization._id)
+        }),
+        user: {
+          id: createdUser._id,
+          organizationId: organization._id,
+          name: createdUser.name,
+          email: createdUser.email,
+          phone: createdUser.phone,
+          role: createdUser.role,
+          organizationRole: createdUser.role,
+          department: createdUser.department,
+          departments: createdUser.departments || [],
+          languagePreference: createdUser.languagePreference,
+          leaveBalance: createdUser.leaveBalance,
+          isActive: createdUser.isActive,
+          workDays: createdUser.workDays || [],
+          workSchedule: createdUser.workSchedule || {}
+        }
+      }
+    });
+  } catch (error) {
+    if (createdUser?._id) {
+      await User.deleteOne({ _id: createdUser._id });
+    }
+
+    if (organization?._id) {
+      await Organization.deleteOne({ _id: organization._id });
+    }
+
+    res.status(error.code === 11000 || error.name === 'ValidationError' ? 400 : 500).json({
+      success: false,
+      message: getOrganizationAccountErrorMessage(error)
+    });
   }
 };
 

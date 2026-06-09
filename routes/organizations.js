@@ -8,6 +8,7 @@ const {
   listOrganizations,
   getOrganizationById,
   createOrganization,
+  createOrganizationAccount,
   updateOrganization,
   updateOrganizationStatus
 } = require('../controllers/organizationController');
@@ -30,6 +31,7 @@ router.post(
 
 router.get('/', authorize('platform_admin'), listOrganizations);
 router.post('/', authorize('platform_admin'), createOrganization);
+router.post('/account', authorize('platform_admin'), createOrganizationAccount);
 router.get('/:id', authorize('platform_admin'), getOrganizationById);
 router.put('/:id', authorize('platform_admin'), updateOrganization);
 router.patch('/:id/status', authorize('platform_admin'), updateOrganizationStatus);
