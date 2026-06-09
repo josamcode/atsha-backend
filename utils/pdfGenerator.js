@@ -1,6 +1,8 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 const QRCode = require('qrcode');
 
 const clampNumber = (value, fallback, min, max) => {
@@ -11,6 +13,117 @@ const clampNumber = (value, fallback, min, max) => {
   }
 
   return Math.min(max, Math.max(min, numericValue));
+};
+
+/**
+ * Download an image from a URL and return it as a Buffer.
+ * Follows redirects (max 3 hops).
+ */
+const downloadImage = (url, redirectCount = 0) => {
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 3) {
+      return reject(new Error('Too many redirects'));
+    }
+
+    const client = String(url).startsWith('https') ? https : http;
+
+    client.get(url, { timeout: 15000 }, (response) => {
+      // Follow redirects
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        const redirectUrl = response.headers.location;
+        downloadImage(redirectUrl, redirectCount + 1).then(resolve).catch(reject);
+        return;
+      }
+
+      if (response.statusCode !== 200) {
+        return reject(new Error(`Failed to download image from ${url}: HTTP ${response.statusCode}`));
+      }
+
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('error', reject);
+    }).on('error', (err) => {
+      // If the URL is a local path being treated as remote, don't crash
+      reject(err);
+    });
+  });
+};
+
+/**
+ * Resolve an image path/URL to a Buffer suitable for PDFKit.
+ * Handles: absolute URLs, /uploads/* local paths, /logo.png static files, data URIs.
+ */
+const resolveAndLoadImage = async (imageUrl) => {
+  if (!imageUrl) {
+    return null;
+  }
+
+  const urlStr = String(imageUrl).trim();
+
+  // Data URI — PDFKit can handle these directly
+  if (urlStr.startsWith('data:')) {
+    return urlStr;
+  }
+
+  // Absolute URL — download it
+  if (/^https?:\/\//i.test(urlStr)) {
+    try {
+      return await downloadImage(urlStr);
+    } catch (err) {
+      console.warn(`[pdfGenerator] Failed to download image from ${urlStr}:`, err.message);
+      return null;
+    }
+  }
+
+  // Local filesystem path (e.g. /uploads/image-xxx.jpg)
+  if (urlStr.startsWith('/uploads/')) {
+    const localPath = path.join(__dirname, '..', urlStr);
+    try {
+      if (fs.existsSync(localPath)) {
+        return fs.readFileSync(localPath);
+      }
+    } catch (err) {
+      console.warn(`[pdfGenerator] Failed to read local file ${localPath}:`, err.message);
+    }
+    // Fallback: try to download from localhost
+    const port = process.env.PORT || 5000;
+    try {
+      return await downloadImage(`http://localhost:${port}${urlStr}`);
+    } catch (err) {
+      console.warn(`[pdfGenerator] Failed to download image from localhost:`, err.message);
+      return null;
+    }
+  }
+
+  // Static files from frontend (e.g. /logo.png, /stamp.png)
+  // Try frontend public directory first, then backend uploads
+  const frontendPublicPath = path.join(__dirname, '..', '..', 'frontend', 'public', urlStr.replace(/^\//, ''));
+  try {
+    if (fs.existsSync(frontendPublicPath)) {
+      return fs.readFileSync(frontendPublicPath);
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  const backendUploadsPath = path.join(__dirname, '..', 'uploads', urlStr.replace(/^\/uploads\//, ''));
+  try {
+    if (fs.existsSync(backendUploadsPath)) {
+      return fs.readFileSync(backendUploadsPath);
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  // Last resort: try to download from localhost
+  const port = process.env.PORT || 5000;
+  try {
+    return await downloadImage(`http://localhost:${port}${urlStr.startsWith('/') ? urlStr : `/${urlStr}`}`);
+  } catch (err) {
+    console.warn(`[pdfGenerator] Failed to resolve image ${urlStr}:`, err.message);
+    return null;
+  }
 };
 
 class PDFGenerator {
@@ -63,11 +176,22 @@ class PDFGenerator {
   }
 
   async generateFormPDF(formInstance, template, user, language = 'en', options = {}) {
+    // Build pdfStyle and load images (logo + watermark) upfront before creating the doc
+    const layout = template.layout || {};
+    const pdfStyle = this.buildPdfStyle(template, options.organization || null);
+    const branding = pdfStyle.branding || {};
+
+    // Pre-load watermark image
+    const watermarkConfig = branding.watermarkConfig || pdfStyle.watermark || {};
+    const watermarkUrl = branding.watermarkUrl || branding.logoUrl;
+    const watermarkEnabled = watermarkConfig.enabled !== false && !!watermarkUrl;
+    let watermarkBuffer = null;
+    if (watermarkEnabled) {
+      watermarkBuffer = await resolveAndLoadImage(watermarkUrl);
+    }
+
     return new Promise(async (resolve, reject) => {
       try {
-        // Get layout configuration from template
-        const layout = template.layout || {};
-        const pdfStyle = this.buildPdfStyle(template, options.organization || null);
         const pageSize = layout.pageSize || 'A4';
         const orientation = layout.orientation || 'portrait';
         const margins = layout.margins || { top: 50, right: 50, bottom: 50, left: 50 };
@@ -99,7 +223,7 @@ class PDFGenerator {
         // Header (if enabled)
         const headerConfig = pdfStyle.header || {};
         if (headerConfig.enabled !== false) {
-          this.addHeader(doc, title, isRTL, pdfStyle, language, margins);
+          await this.addHeader(doc, title, isRTL, pdfStyle, language, margins);
         }
 
         // General Information
@@ -127,12 +251,10 @@ class PDFGenerator {
         // Filter visible sections
         sectionsToRender = sectionsToRender.filter(section => section.visible !== false);
 
-        sectionsToRender.forEach((section, index) => {
-          this.addSection(doc, section, formInstance.values, language, isRTL, pdfStyle, margins);
-          if (index < sectionsToRender.length - 1) {
-            doc.moveDown();
-          }
-        });
+        for (const section of sectionsToRender) {
+          await this.addSection(doc, section, formInstance.values, language, isRTL, pdfStyle, margins);
+          doc.moveDown();
+        }
 
         // Status and Approval
         this.addApprovalSection(doc, formInstance, language, isRTL, pdfStyle, margins);
@@ -143,6 +265,11 @@ class PDFGenerator {
           await this.addFooter(doc, isRTL, pdfStyle, language, margins);
         }
 
+        // Watermark — render on all pages after content is drawn
+        if (watermarkBuffer) {
+          this.addWatermark(doc, watermarkBuffer, pdfStyle, margins);
+        }
+
         doc.end();
       } catch (error) {
         reject(error);
@@ -150,7 +277,7 @@ class PDFGenerator {
     });
   }
 
-  addHeader(doc, title, isRTL, pdfStyle, language, margins) {
+  async addHeader(doc, title, isRTL, pdfStyle, language, margins) {
     const headerConfig = pdfStyle.header || {};
     const branding = pdfStyle.branding || {};
     const headerHeight = headerConfig.height || 80;
@@ -159,6 +286,9 @@ class PDFGenerator {
     const headerFontSize = headerConfig.fontSize || 16;
     const primaryColor = branding.primaryColor || pdfStyle.colors?.primary || '#d4b900';
     const companyName = branding.companyName?.[language] || branding.companyName?.en || 'AraRM';
+    const headerLayout = headerConfig.layout || 'default';
+    const showLogo = headerConfig.showLogo !== false && !!branding.logoUrl;
+    const logoSize = clampNumber(headerConfig.logoSize, 64, 0, 160);
 
     // Draw header background
     doc.rect(margins.left, margins.top, doc.page.width - margins.left - margins.right, headerHeight)
@@ -166,45 +296,106 @@ class PDFGenerator {
 
     let currentY = margins.top + 10;
 
-    // Logo (if enabled and URL provided)
-    if (headerConfig.showLogo !== false && branding.logoUrl) {
-      // Note: PDFKit doesn't support image URLs directly, would need to download first
-      // For now, we'll just show company name
+    // Load logo image if enabled
+    let logoBuffer = null;
+    if (showLogo) {
+      logoBuffer = await resolveAndLoadImage(branding.logoUrl);
     }
 
-    // Company Name
-    doc.fontSize(headerFontSize + 4)
-      .fillColor(primaryColor)
-      .text(companyName, margins.left, currentY, {
-        align: headerConfig.logoPosition || 'left',
-        width: doc.page.width - margins.left - margins.right
-      });
+    if (headerLayout === 'split') {
+      // Split Layout: Logo + Company on left, Form Title on right
+      // ... we'll use a simplified layout for now
+    }
 
-    currentY = doc.y + 5;
+    // Logo rendering
+    if (logoBuffer) {
+      const logoX = margins.left + 10;
+      const logoY = margins.top + (headerHeight - logoSize) / 2;
+      try {
+        doc.image(logoBuffer, logoX, logoY, {
+          fit: [logoSize, logoSize],
+          align: 'center',
+          valign: 'center'
+        });
+        // Shift text to the right of the logo
+        const textX = logoX + logoSize + 15;
 
-    // Form Title (if enabled)
-    if (headerConfig.showTitle !== false) {
-      doc.fontSize(headerFontSize)
-        .fillColor(headerTextColor)
-        .text(title, margins.left, currentY, {
+        // Company Name
+        doc.fontSize(headerFontSize + 4)
+          .fillColor(primaryColor)
+          .text(companyName, textX, currentY, {
+            align: 'left',
+            width: doc.page.width - margins.right - textX
+          });
+
+        currentY = doc.y + 5;
+
+        // Form Title (if enabled)
+        if (headerConfig.showTitle !== false) {
+          doc.fontSize(headerFontSize)
+            .fillColor(headerTextColor)
+            .text(title, textX, currentY, {
+              align: 'left',
+              width: doc.page.width - margins.right - textX
+            });
+          currentY = doc.y + 5;
+        }
+
+        // Date (if enabled)
+        if (headerConfig.showDate !== false) {
+          const dateText = isRTL
+            ? `التاريخ: ${new Date().toLocaleDateString('ar-EG')}`
+            : `Date: ${new Date().toLocaleDateString()}`;
+          doc.fontSize(headerFontSize - 4)
+            .fillColor(headerTextColor)
+            .text(dateText, textX, currentY, {
+              align: 'left',
+              width: doc.page.width - margins.right - textX
+            });
+        }
+      } catch (err) {
+        console.warn('[pdfGenerator] Error rendering logo in header:', err.message);
+        // Fallback: render text without logo
+        logoBuffer = null;
+      }
+    }
+
+    if (!logoBuffer) {
+      // No logo — render text only
+      // Company Name
+      doc.fontSize(headerFontSize + 4)
+        .fillColor(primaryColor)
+        .text(companyName, margins.left, currentY, {
           align: headerConfig.logoPosition || 'left',
           width: doc.page.width - margins.left - margins.right
         });
-      currentY = doc.y + 5;
-    }
 
-    // Date (if enabled)
-    if (headerConfig.showDate !== false) {
-      const dateText = isRTL
-        ? `التاريخ: ${new Date().toLocaleDateString('ar-EG')}`
-        : `Date: ${new Date().toLocaleDateString()}`;
-      doc.fontSize(headerFontSize - 4)
-        .fillColor(headerTextColor)
-        .text(dateText, margins.left, currentY, {
-          align: headerConfig.logoPosition || 'left',
-          width: doc.page.width - margins.left - margins.right
-        });
       currentY = doc.y + 5;
+
+      // Form Title (if enabled)
+      if (headerConfig.showTitle !== false) {
+        doc.fontSize(headerFontSize)
+          .fillColor(headerTextColor)
+          .text(title, margins.left, currentY, {
+            align: headerConfig.logoPosition || 'left',
+            width: doc.page.width - margins.left - margins.right
+          });
+        currentY = doc.y + 5;
+      }
+
+      // Date (if enabled)
+      if (headerConfig.showDate !== false) {
+        const dateText = isRTL
+          ? `التاريخ: ${new Date().toLocaleDateString('ar-EG')}`
+          : `Date: ${new Date().toLocaleDateString()}`;
+        doc.fontSize(headerFontSize - 4)
+          .fillColor(headerTextColor)
+          .text(dateText, margins.left, currentY, {
+            align: headerConfig.logoPosition || 'left',
+            width: doc.page.width - margins.left - margins.right
+          });
+        currentY = doc.y + 5;
+      }
     }
 
     // Draw separator line
@@ -324,7 +515,7 @@ class PDFGenerator {
     });
   }
 
-  addSection(doc, section, values, language, isRTL, pdfStyle, margins) {
+  async addSection(doc, section, values, language, isRTL, pdfStyle, margins) {
     // Skip if section is not visible
     if (section.visible === false) return;
 
@@ -391,16 +582,110 @@ class PDFGenerator {
     let fieldsToRender = section.fields.filter(field => field.visible !== false);
     fieldsToRender.sort((a, b) => (a.order || 0) - (b.order || 0));
 
-    fieldsToRender.forEach(field => {
+    for (const field of fieldsToRender) {
       const fieldKey = `${section.id}.${field.key}`;
       const value = values.get ? values.get(fieldKey) : values[fieldKey];
       const fieldLabel = field.label[language] || field.label.en;
 
       // Skip if field PDF display is disabled
       if (field.pdfDisplay?.showValue === false && field.pdfDisplay?.showLabel === false) {
-        return;
+        continue;
       }
 
+      // --- Image field handling ---
+      if (field.type === 'image' && field.pdfDisplay?.showValue !== false) {
+        const showLabel = field.pdfDisplay?.showLabel !== false;
+        const fieldLayout = field.layout || {};
+
+        // Extract image URL from value
+        let imageUrl = '';
+        if (value) {
+          if (typeof value === 'string') {
+            imageUrl = value;
+          } else if (typeof value === 'object') {
+            imageUrl = value.url || value.path || '';
+          }
+        }
+
+        // Show label
+        if (showLabel) {
+          doc.fontSize(fieldFontSize)
+            .fillColor(textColor)
+            .font('Helvetica');
+          doc.text(fieldLabel, margins.left, doc.y, {
+            align: isRTL ? 'right' : 'left',
+            width: doc.page.width - margins.left - margins.right
+          });
+          doc.y += 5;
+        }
+
+        // Render image if URL exists
+        if (imageUrl) {
+          const imgBuffer = await resolveAndLoadImage(imageUrl);
+          if (imgBuffer) {
+            const imgWidth = Math.min(
+              Math.max(Number(fieldLayout.imageWidth) || 220, 40),
+              doc.page.width - margins.left - margins.right
+            );
+            const imgHeight = Math.min(
+              Math.max(Number(fieldLayout.imageHeight) || 160, 40),
+              doc.page.height - doc.y - margins.bottom
+            );
+
+            // Check if we need a new page for the image
+            if (doc.y + imgHeight > doc.page.height - margins.bottom) {
+              doc.addPage();
+              doc.y = margins.top;
+            }
+
+            try {
+              doc.image(imgBuffer, margins.left, doc.y, {
+                fit: [imgWidth, imgHeight],
+                align: 'center',
+                valign: 'center'
+              });
+              doc.y += imgHeight + 10;
+            } catch (err) {
+              console.warn(`[pdfGenerator] Error rendering image field ${fieldKey}:`, err.message);
+              doc.fontSize(fieldFontSize)
+                .fillColor(textColor)
+                .font('Helvetica')
+                .text(language === 'ar' ? '(تعذر عرض الصورة)' : '(Could not display image)',
+                  margins.left, doc.y, {
+                    align: isRTL ? 'right' : 'left',
+                    width: doc.page.width - margins.left - margins.right
+                  });
+              doc.y += fieldSpacing;
+            }
+          } else {
+            // Image couldn't be loaded
+            doc.fontSize(fieldFontSize)
+              .fillColor(textColor)
+              .font('Helvetica')
+              .text(language === 'ar' ? 'لا توجد صورة مرفوعة' : 'No image uploaded',
+                margins.left, doc.y, {
+                  align: isRTL ? 'right' : 'left',
+                  width: doc.page.width - margins.left - margins.right
+                });
+            doc.y += fieldSpacing;
+          }
+        } else {
+          // No image value
+          doc.fontSize(fieldFontSize)
+            .fillColor(textColor)
+            .font('Helvetica')
+            .text(language === 'ar' ? 'لا توجد صورة مرفوعة' : 'No image uploaded',
+              margins.left, doc.y, {
+                align: isRTL ? 'right' : 'left',
+                width: doc.page.width - margins.left - margins.right
+              });
+          doc.y += fieldSpacing;
+        }
+
+        continue;
+      }
+
+      // --- Non-image fields (text, date, boolean, etc.) ---
       let displayValue = value !== undefined && value !== null
         ? value
         : (field.defaultValue?.[language] || field.defaultValue?.en || field.defaultValue?.ar || '-');
@@ -418,7 +703,7 @@ class PDFGenerator {
       // Field display options
       const showLabel = field.pdfDisplay?.showLabel !== false;
       const showValue = field.pdfDisplay?.showValue !== false;
-      const fieldFontSize = field.pdfDisplay?.fontSize || fieldFontSize;
+      const fieldFontSizeVal = field.pdfDisplay?.fontSize || fieldFontSize;
       const isBold = field.pdfDisplay?.bold || false;
 
       // Build display text
@@ -436,7 +721,7 @@ class PDFGenerator {
       }
 
       if (displayText) {
-        doc.fontSize(fieldFontSize)
+        doc.fontSize(fieldFontSizeVal)
           .fillColor(textColor);
 
         if (isBold) {
@@ -452,7 +737,7 @@ class PDFGenerator {
 
         doc.y += fieldSpacing;
       }
-    });
+    }
 
     doc.y += sectionSpacing;
   }
@@ -511,6 +796,59 @@ class PDFGenerator {
         align: isRTL ? 'right' : 'left',
         width: doc.page.width - margins.left - margins.right
       });
+    }
+  }
+
+  addWatermark(doc, watermarkBuffer, pdfStyle, margins) {
+    const branding = pdfStyle.branding || {};
+    // Watermark properties can be directly on branding (frontend style)
+    // or nested under watermarkConfig/pdfStyle.watermark
+    const watermarkConfig = branding.watermarkConfig || pdfStyle.watermark || branding;
+    const watermarkSize = clampNumber(
+      watermarkConfig.watermarkSize || watermarkConfig.size,
+      55, 0, 100
+    );
+    const watermarkOpacity = clampNumber(
+      watermarkConfig.watermarkOpacity || watermarkConfig.opacity,
+      5, 0, 100
+    ) / 100;
+
+    if (!watermarkBuffer) return;
+
+    const pages = doc.bufferedPageRange();
+
+    for (let i = 0; i < pages.count; i++) {
+      doc.switchToPage(i);
+
+      const pageWidth = doc.page.width - margins.left - margins.right;
+      const pageHeight = doc.page.height - margins.top - margins.bottom;
+      const imgWidth = (pageWidth * watermarkSize) / 100;
+      const imgHeight = pageHeight * 0.9; // Max 90% of page height
+
+      const x = margins.left + (pageWidth - imgWidth) / 2;
+      const y = margins.top + (pageHeight - Math.min(imgHeight, imgWidth)) / 2;
+
+      // Save graphics state
+      doc.save();
+
+      // Set opacity for watermark effect
+      doc.opacity(watermarkOpacity);
+
+      // Rotate slightly for watermark look
+      doc.rotate(10, { origin: [doc.page.width / 2, doc.page.height / 2] });
+
+      try {
+        doc.image(watermarkBuffer, x, y, {
+          fit: [imgWidth, Math.min(imgHeight, imgWidth)],
+          align: 'center',
+          valign: 'center'
+        });
+      } catch (err) {
+        console.warn('[pdfGenerator] Error rendering watermark:', err.message);
+      }
+
+      // Restore graphics state
+      doc.restore();
     }
   }
 
