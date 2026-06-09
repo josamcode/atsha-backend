@@ -45,6 +45,10 @@ const userSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
+  imageStorageKey: {
+    type: String,
+    trim: true
+  },
   password: {
     type: String,
     required: [true, 'Password is required'],

@@ -591,6 +591,7 @@ exports.getUser = async (req, res) => {
 // @access  Private (Platform Admin, Organization Admin)
 exports.createUser = async (req, res) => {
   let uploadedImageUrl = null;
+  let uploadedImageStorageKey = null;
   let createdUser = null;
 
   try {
@@ -641,6 +642,7 @@ exports.createUser = async (req, res) => {
     if (req.file) {
       const uploadedImage = await uploadUserImage(req.file);
       uploadedImageUrl = uploadedImage.secure_url;
+      uploadedImageStorageKey = uploadedImage.storageKey || '';
     }
 
     createdUser = await User.create(attachOrganizationId({
@@ -658,7 +660,8 @@ exports.createUser = async (req, res) => {
       nationality: nationality || undefined,
       idNumber: idNumber || undefined,
       jobTitle: jobTitle || undefined,
-      image: uploadedImageUrl || undefined
+      image: uploadedImageUrl || undefined,
+      imageStorageKey: uploadedImageStorageKey || undefined
     }, organization));
 
     await createNotification({
@@ -703,7 +706,7 @@ exports.createUser = async (req, res) => {
   } catch (error) {
     if (!createdUser && uploadedImageUrl) {
       try {
-        await deleteStoredAsset(uploadedImageUrl);
+        await deleteStoredAsset(uploadedImageStorageKey || uploadedImageUrl);
       } catch (cleanupError) {
         console.error('Error deleting uploaded user image after failure:', cleanupError);
       }
@@ -718,6 +721,7 @@ exports.createUser = async (req, res) => {
 // @access  Private (Platform Admin, Organization Admin)
 exports.updateUser = async (req, res) => {
   let newImageUrl = null;
+  let newImageStorageKey = null;
   let updateCompleted = false;
 
   try {
@@ -799,7 +803,9 @@ exports.updateUser = async (req, res) => {
     if (req.file) {
       const uploadedImage = await uploadUserImage(req.file);
       newImageUrl = uploadedImage.secure_url;
+      newImageStorageKey = uploadedImage.storageKey || '';
       updateFields.image = newImageUrl;
+      updateFields.imageStorageKey = newImageStorageKey;
     }
 
     const refreshTokenShouldBeCleared = (
@@ -821,7 +827,10 @@ exports.updateUser = async (req, res) => {
 
     if (newImageUrl && user.image && user.image !== newImageUrl) {
       try {
-        await deleteStoredAsset(user.image);
+        await deleteStoredAsset({
+          url: user.image,
+          storageKey: user.imageStorageKey || ''
+        });
       } catch (cleanupError) {
         console.error('Error deleting old user image:', cleanupError);
       }
@@ -864,7 +873,7 @@ exports.updateUser = async (req, res) => {
   } catch (error) {
     if (!updateCompleted && newImageUrl) {
       try {
-        await deleteStoredAsset(newImageUrl);
+        await deleteStoredAsset(newImageStorageKey || newImageUrl);
       } catch (cleanupError) {
         console.error('Error deleting newly uploaded user image after failure:', cleanupError);
       }
@@ -905,7 +914,10 @@ exports.deleteUser = async (req, res) => {
 
     if (user.image) {
       try {
-        await deleteStoredAsset(user.image);
+        await deleteStoredAsset({
+          url: user.image,
+          storageKey: user.imageStorageKey || ''
+        });
       } catch (cleanupError) {
         console.error('Error deleting user image after delete:', cleanupError);
       }

@@ -299,6 +299,146 @@ console.log('\n=== R2 Public URL Edge Cases ===\n');
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4: resolveDeletionTarget & object-aware deleteStoredAsset
+// ---------------------------------------------------------------------------
+
+console.log('\n=== Phase 4: resolveDeletionTarget Tests ===\n');
+
+const { resolveDeletionTarget } = require('../utils/mediaStorage');
+
+// 31. Null/undefined returns empty string (safe no-op)
+{
+  assertEqual(resolveDeletionTarget(null), '', 'null → empty string');
+  assertEqual(resolveDeletionTarget(undefined), '', 'undefined → empty string');
+  assertEqual(resolveDeletionTarget(''), '', 'empty string → empty string');
+}
+
+// 32. Plain string pass-through
+{
+  assertEqual(
+    resolveDeletionTarget('https://res.cloudinary.com/demo/image/upload/v1/test.jpg'),
+    'https://res.cloudinary.com/demo/image/upload/v1/test.jpg',
+    'Cloudinary URL string passed through unchanged'
+  );
+  assertEqual(
+    resolveDeletionTarget('https://media.arascreen.ai/ararms/users/x.jpg'),
+    'https://media.arascreen.ai/ararms/users/x.jpg',
+    'R2 URL string passed through unchanged'
+  );
+  assertEqual(
+    resolveDeletionTarget('/uploads/photo.jpg'),
+    '/uploads/photo.jpg',
+    'Local upload path passed through unchanged'
+  );
+}
+
+// 33. Object with storageKey — prefers storageKey (exact R2 delete)
+{
+  const obj = { url: 'https://media.arascreen.ai/ararms/users/abc.jpg', storageKey: 'ararms/users/abc.jpg' };
+  assertEqual(resolveDeletionTarget(obj), 'ararms/users/abc.jpg', 'Object with storageKey → returns storageKey');
+}
+
+// 34. Object without storageKey — falls back to url, then path
+{
+  const obj = { url: 'https://res.cloudinary.com/demo/image/upload/v1/test.jpg', path: '/old/path' };
+  assertEqual(resolveDeletionTarget(obj), 'https://res.cloudinary.com/demo/image/upload/v1/test.jpg', 'Object without storageKey → url');
+}
+
+// 35. Object with only path (no url)
+{
+  const obj = { path: '/uploads/old-file.pdf' };
+  assertEqual(resolveDeletionTarget(obj), '/uploads/old-file.pdf', 'Object with only path → path');
+}
+
+// 36. Object with empty fields still safe
+{
+  assertEqual(resolveDeletionTarget({}), '', 'Empty object → empty string');
+  assertEqual(resolveDeletionTarget({ url: '', path: '' }), '', 'Object with empty url/path → empty string');
+}
+
+// 37. R2 storageKey in object takes priority over url
+{
+  const obj = { url: 'https://media.arascreen.ai/ararms/users/uuid.jpg', storageKey: 'ararms/users/uuid.jpg', path: 'https://media.arascreen.ai/ararms/users/uuid.jpg' };
+  const result = resolveDeletionTarget(obj);
+  // storageKey should win even though url and path are also R2 URLs
+  assertEqual(result, 'ararms/users/uuid.jpg', 'storageKey preferred over url/path in objects');
+}
+
+console.log('\n=== Phase 4: Object-aware deleteStoredAsset Routing ===\n');
+
+const { deleteStoredAsset } = require('../utils/mediaStorage');
+
+// 38. deleteStoredAsset with object (storageKey for R2) — validates
+//     Note: won't actually delete (no real S3), but should not throw and should resolve
+{
+  // We cannot test actual deletion without real credentials,
+  // but we can verify the function accepts objects without throwing.
+  const testObj = { url: 'https://media.arascreen.ai/ararms/users/nonexistent.jpg', storageKey: 'ararms/users/nonexistent.jpg' };
+  // deleteStoredAsset should not throw on object input; it should attempt the delete and return false
+  deleteStoredAsset(testObj).then((result) => {
+    assertEqual(typeof result, 'boolean', 'deleteStoredAsset with object returns boolean');
+    // Not asserting true/false — depends on whether S3 client is configured
+  }).catch((_err) => {
+    // If R2 is not configured, this might throw. That's acceptable for testing.
+    // We just don't want it to crash on wrong input type.
+  });
+}
+
+// 39. Null safety — deleteStoredAsset with null
+{
+  deleteStoredAsset(null).then((result) => {
+    assertEqual(result, false, 'deleteStoredAsset(null) → false');
+  });
+}
+
+// 40. deleteStoredAsset with undefined
+{
+  deleteStoredAsset(undefined).then((result) => {
+    assertEqual(result, false, 'deleteStoredAsset(undefined) → false');
+  });
+}
+
+// 41. deleteStoredAsset with empty string
+{
+  deleteStoredAsset('').then((result) => {
+    assertEqual(result, false, 'deleteStoredAsset("") → false');
+  });
+}
+
+console.log('\n=== Phase 4: Model Schema Verification ===\n');
+
+// 42. FormInstance images[] has storageKey in schema
+{
+  const FormInstance = require('../models/FormInstance');
+  // Mongoose stores subdocument paths in the DocumentArray's own schema
+  const imagesSchema = FormInstance.schema.path('images');
+  const hasImageStorageKey = imagesSchema && imagesSchema.schema &&
+    'storageKey' in imagesSchema.schema.paths;
+  assert(hasImageStorageKey, 'FormInstance schema includes images.storageKey');
+}
+
+// 43. User model has imageStorageKey
+{
+  const User = require('../models/User');
+  const hasImageStorageKey = 'imageStorageKey' in User.schema.paths;
+  assert(hasImageStorageKey, 'User schema includes imageStorageKey');
+}
+
+// 44. Organization branding has logoStorageKey and watermarkStorageKey
+{
+  const Organization = require('../models/Organization');
+  const brandingPaths = Object.keys(Organization.schema.paths).filter(
+    (p) => p.startsWith('branding.')
+  );
+  const hasLogoKey = brandingPaths.includes('branding.logoStorageKey');
+  const hasWatermarkKey = brandingPaths.includes('branding.watermarkStorageKey');
+  const hasFaviconKey = brandingPaths.includes('branding.faviconStorageKey');
+  assert(hasLogoKey, 'Organization schema includes branding.logoStorageKey');
+  assert(hasWatermarkKey, 'Organization schema includes branding.watermarkStorageKey');
+  assert(hasFaviconKey, 'Organization schema includes branding.faviconStorageKey');
+}
+
+// ---------------------------------------------------------------------------
 // Result
 // ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(50)}`);

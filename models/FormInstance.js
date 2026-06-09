@@ -69,6 +69,7 @@ const formInstanceSchema = new mongoose.Schema({
     filename: String,
     url: String,
     path: String,
+    storageKey: String,
     mimetype: String,
     size: Number,
     uploadedAt: {

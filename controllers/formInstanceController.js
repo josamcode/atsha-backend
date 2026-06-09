@@ -177,10 +177,10 @@ const extractStoredAssetPathsFromValues = (values = {}) => (
     .filter(Boolean)
 );
 
-const cleanupStoredAssets = async (assetPaths = []) => {
-  await Promise.all(assetPaths.filter(Boolean).map(async (assetPath) => {
+const cleanupStoredAssets = async (assets = []) => {
+  await Promise.all(assets.filter(Boolean).map(async (asset) => {
     try {
-      await deleteStoredAsset(assetPath);
+      await deleteStoredAsset(asset);
     } catch (cleanupError) {
       console.error('Error deleting stored form asset:', cleanupError);
     }
@@ -217,6 +217,7 @@ const applyFieldImageUploads = async ({
 
     const imageValue = {
       url: uploadedImage.secure_url,
+      storageKey: uploadedImage.storageKey || '',
       filename: file.originalname,
       mimetype: file.mimetype,
       size: file.size
@@ -365,7 +366,8 @@ const ensureInstanceApprovalAccess = (req, instance) => {
 const deleteInstanceAssets = async (instance) => {
   const assets = [
     ...(instance.attachments || []).map((entry) => entry.path).filter(Boolean),
-    ...(instance.images || []).map((entry) => getImageAssetPath(entry)).filter(Boolean),
+    // Pass full image subdocuments so storageKey is preferred for R2 deletes
+    ...(instance.images || []).filter((img) => img.url || img.path || img.storageKey),
     ...extractStoredAssetPathsFromValues(instance.values || {})
   ];
 
@@ -664,7 +666,7 @@ exports.createFormInstance = async (req, res) => {
     });
   } catch (error) {
     if (uploadedFieldAssets.length > 0) {
-      await cleanupStoredAssets(uploadedFieldAssets.map((asset) => asset.url || asset.path));
+      await cleanupStoredAssets(uploadedFieldAssets);
     }
 
     sendControllerError(res, error);
@@ -802,7 +804,7 @@ exports.updateFormInstance = async (req, res) => {
     });
   } catch (error) {
     if (uploadedFieldAssets.length > 0) {
-      await cleanupStoredAssets(uploadedFieldAssets.map((asset) => asset.url || asset.path));
+      await cleanupStoredAssets(uploadedFieldAssets);
     }
 
     sendControllerError(res, error);
@@ -1062,6 +1064,7 @@ exports.uploadFormImages = async (req, res) => {
         filename: file.originalname,
         url: uploadedImage.secure_url,
         path: uploadedImage.secure_url,
+        storageKey: uploadedImage.storageKey || '',
         mimetype: file.mimetype,
         size: file.size,
         uploadedAt: new Date()
@@ -1085,7 +1088,7 @@ exports.uploadFormImages = async (req, res) => {
     if (!imagesSaved && uploadedImages.length > 0) {
       await Promise.all(uploadedImages.map(async (image) => {
         try {
-          await deleteStoredAsset(getImageAssetPath(image));
+          await deleteStoredAsset(image);
         } catch (cleanupError) {
           console.error('Error deleting uploaded form image after failure:', cleanupError);
         }
@@ -1122,11 +1125,10 @@ exports.deleteFormImage = async (req, res) => {
       });
     }
 
-    const imageAssetPath = getImageAssetPath(image);
-
-    if (imageAssetPath) {
+    if (image.url || image.path || image.storageKey) {
       try {
-        await deleteStoredAsset(imageAssetPath);
+        // Pass full image subdoc — storageKey is preferred for R2 deletes
+        await deleteStoredAsset(image);
       } catch (cleanupError) {
         console.error('Error deleting form image asset:', cleanupError);
       }

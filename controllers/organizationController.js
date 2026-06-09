@@ -20,6 +20,11 @@ const BRANDING_ASSET_FIELD_MAP = {
   watermark: 'watermarkUrl'
 };
 
+const BRANDING_STORAGE_KEY_FIELD_MAP = {
+  logo: 'logoStorageKey',
+  watermark: 'watermarkStorageKey'
+};
+
 const EMAIL_NOTIFICATION_CATEGORY_KEYS = [
   'users',
   'invitations',
@@ -573,6 +578,7 @@ exports.updateCurrentOrganizationSettings = async (req, res) => {
 // @access  Private (Organization Admin, Platform Admin)
 exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
   let uploadedAssetUrl = null;
+  let uploadedAssetStorageKey = null;
 
   try {
     const organization = await resolveManagedOrganization(req);
@@ -586,6 +592,7 @@ exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
 
     const assetType = String(req.params.assetType || '').trim().toLowerCase();
     const brandingField = BRANDING_ASSET_FIELD_MAP[assetType];
+    const storageKeyField = BRANDING_STORAGE_KEY_FIELD_MAP[assetType];
 
     if (!brandingField) {
       return res.status(400).json({
@@ -609,6 +616,10 @@ exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
     }
 
     const previousAssetUrl = organization.branding?.[brandingField] || null;
+    const previousAssetStorageKey = storageKeyField
+      ? organization.branding?.[storageKeyField] || null
+      : null;
+
     const uploadedAsset = await uploadOrganizationBrandingAsset(
       req.file,
       organization._id.toString(),
@@ -616,14 +627,22 @@ exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
     );
 
     uploadedAssetUrl = uploadedAsset.secure_url;
-    organization.branding = mergeObject(organization.branding, {
-      [brandingField]: uploadedAssetUrl
-    });
+    uploadedAssetStorageKey = uploadedAsset.storageKey || '';
+
+    const brandingUpdate = { [brandingField]: uploadedAssetUrl };
+    if (storageKeyField) {
+      brandingUpdate[storageKeyField] = uploadedAssetStorageKey;
+    }
+
+    organization.branding = mergeObject(organization.branding, brandingUpdate);
     await organization.save();
 
     if (previousAssetUrl && previousAssetUrl !== uploadedAssetUrl) {
       try {
-        await deleteStoredAsset(previousAssetUrl);
+        await deleteStoredAsset({
+          url: previousAssetUrl,
+          storageKey: previousAssetStorageKey || ''
+        });
       } catch (cleanupError) {
         console.error('Error deleting previous organization branding asset:', cleanupError);
       }
@@ -653,7 +672,7 @@ exports.uploadCurrentOrganizationBrandingAsset = async (req, res) => {
   } catch (error) {
     if (uploadedAssetUrl) {
       try {
-        await deleteStoredAsset(uploadedAssetUrl);
+        await deleteStoredAsset(uploadedAssetStorageKey || uploadedAssetUrl);
       } catch (cleanupError) {
         console.error('Error deleting uploaded branding asset after failure:', cleanupError);
       }

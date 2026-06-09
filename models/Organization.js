@@ -182,11 +182,23 @@ const organizationSchema = new mongoose.Schema({
       type: String,
       trim: true
     },
+    logoStorageKey: {
+      type: String,
+      trim: true
+    },
     watermarkUrl: {
       type: String,
       trim: true
     },
+    watermarkStorageKey: {
+      type: String,
+      trim: true
+    },
     faviconUrl: {
+      type: String,
+      trim: true
+    },
+    faviconStorageKey: {
       type: String,
       trim: true
     },

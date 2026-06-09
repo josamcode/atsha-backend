@@ -58,6 +58,44 @@ function isR2Url(storedPath) {
   return false;
 }
 
+/**
+ * Determine whether a string looks like a raw R2 storage key
+ * (starts with the configured R2_KEY_PREFIX, e.g. "ararms/...").
+ */
+function isR2StorageKey(value) {
+  if (!value || typeof value !== 'string') return false;
+  const prefix = (process.env.R2_KEY_PREFIX || 'ararms').replace(/^\/+|\/+$/g, '');
+  return value.startsWith(`${prefix}/`) || value === prefix;
+}
+
+/**
+ * Resolve the best deletion target from various input shapes.
+ *
+ *   - null / undefined / ''  →  ''             (safe no-op)
+ *   - string                 →  pass-through   (URL, path, or raw storageKey)
+ *   - object { storageKey }  →  storageKey     (exact R2 delete)
+ *   - object { url, path }   →  url || path    (backward compat)
+ *
+ * @param {string|object|null|undefined} input
+ * @returns {string}
+ */
+function resolveDeletionTarget(input) {
+  if (!input) return '';
+
+  // Plain string — pass through unchanged
+  if (typeof input === 'string') return input;
+
+  // Object (image record, field value, etc.)
+  if (typeof input === 'object') {
+    // Prefer storageKey for exact provider deletes
+    if (input.storageKey) return input.storageKey;
+    // Fallback to URL/path for backward compat
+    return input.url || input.path || '';
+  }
+
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // Local uploads
 // ---------------------------------------------------------------------------
@@ -91,42 +129,54 @@ async function deleteLocalUpload(storedPath) {
 // ---------------------------------------------------------------------------
 
 /**
- * Delete a stored asset, dispatching to the correct provider based on URL.
+ * Delete a stored asset, dispatching to the correct provider.
  *
- * Order of dispatch:
+ * Accepts both legacy string inputs (URL, path) and object inputs
+ * (image records with storageKey/url/path fields).
+ *
+ * Dispatch order:
  *   1. /uploads/*              → local filesystem
  *   2. res.cloudinary.com/*    → Cloudinary
  *   3. media.arascreen.ai/*    → R2
- *   4. Fallback: try R2 first (key-based), then Cloudinary (public_id extraction)
+ *   4. Raw R2 storageKey       → R2 (exact key, no URL parsing)
+ *   5. Fallback: try Cloudinary, then R2
  *
- * @param {string} storedPath
+ * @param {string|object} storedPath — URL string, path, or image record object
  * @returns {Promise<boolean>}
  */
 async function deleteStoredAsset(storedPath) {
-  if (!storedPath) {
+  // Resolve object records → best deletion string
+  const resolvedPath = resolveDeletionTarget(storedPath);
+
+  if (!resolvedPath) {
     return false;
   }
 
   // 1. Local uploads
-  if (storedPath.startsWith('/uploads/')) {
-    return deleteLocalUpload(storedPath);
+  if (resolvedPath.startsWith('/uploads/')) {
+    return deleteLocalUpload(resolvedPath);
   }
 
   // 2. Cloudinary URL
-  if (isCloudinaryUrl(storedPath)) {
-    return cloudinaryProvider.delete(storedPath);
+  if (isCloudinaryUrl(resolvedPath)) {
+    return cloudinaryProvider.delete(resolvedPath);
   }
 
   // 3. R2 URL
-  if (isR2Url(storedPath)) {
-    return r2Provider.delete(storedPath);
+  if (isR2Url(resolvedPath)) {
+    return r2Provider.delete(resolvedPath);
   }
 
-  // 4. Ambiguous — try Cloudinary first (backward compat), then R2
-  const deletedByCloudinary = await cloudinaryProvider.delete(storedPath);
+  // 4. Raw R2 storageKey (e.g. "ararms/users/abc.jpg") — direct dispatch
+  if (isR2StorageKey(resolvedPath)) {
+    return r2Provider.delete(resolvedPath);
+  }
+
+  // 5. Ambiguous — try Cloudinary first (backward compat), then R2
+  const deletedByCloudinary = await cloudinaryProvider.delete(resolvedPath);
   if (deletedByCloudinary) return true;
 
-  const deletedByR2 = await r2Provider.delete(storedPath);
+  const deletedByR2 = await r2Provider.delete(resolvedPath);
   return deletedByR2;
 }
 
@@ -229,6 +279,7 @@ async function uploadOrganizationBrandingAsset(file, organizationId, assetType) 
 module.exports = {
   deleteStoredAsset,
   deleteLocalUpload,
+  resolveDeletionTarget,
   uploadFormImage,
   uploadOrganizationBrandingAsset,
   uploadUserImage
