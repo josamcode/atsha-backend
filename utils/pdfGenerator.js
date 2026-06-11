@@ -515,6 +515,16 @@ class PDFGenerator {
     });
   }
 
+  /**
+   * Flatten grouped table columns into leaf columns (replicates frontend getLeafTableColumns).
+   */
+  _getLeafTableColumns(columns = []) {
+    return columns.flatMap((col) => {
+      const children = Array.isArray(col?.children) ? col.children.filter(Boolean) : [];
+      return children.length > 0 ? this._getLeafTableColumns(children) : [col];
+    });
+  }
+
   async addSection(doc, section, values, language, isRTL, pdfStyle, margins) {
     // Skip if section is not visible
     if (section.visible === false) return;
@@ -528,6 +538,8 @@ class PDFGenerator {
     const textColor = pdfStyle.colors?.text || '#000000';
     const borderColor = sectionStyle.borderColor || pdfStyle.colors?.border || '#e5e7eb';
     const backgroundColor = sectionStyle.backgroundColor || '#ffffff';
+    const advancedLayout = section.advancedLayout || {};
+    const layoutType = advancedLayout.layoutType || 'simple';
 
     // Check if we need a new page
     if (doc.y > doc.page.height - margins.bottom - 100) {
@@ -539,43 +551,57 @@ class PDFGenerator {
     const sectionLabel = section.label[language] || section.label.en;
     const sectionType = section.sectionType || 'normal';
 
+    // Check if title should be shown
+    const showTitle = advancedLayout.styling?.showTitle !== false;
+
     // Apply section-specific styling based on sectionType
     if (sectionType === 'header') {
       // Header section - larger, centered
-      doc.fontSize(sectionFontSize + 4)
-        .fillColor(primaryColor)
-        .text(sectionLabel, margins.left, doc.y, {
-          align: 'center',
-          width: doc.page.width - margins.left - margins.right
-        });
-      doc.y += sectionSpacing;
+      if (showTitle) {
+        doc.fontSize(sectionFontSize + 4)
+          .fillColor(primaryColor)
+          .text(sectionLabel, margins.left, doc.y, {
+            align: 'center',
+            width: doc.page.width - margins.left - margins.right
+          });
+        doc.y += sectionSpacing;
+      }
     } else {
       // Normal section
-      // Draw section background if enabled
-      if (sectionStyle.showBackground && backgroundColor !== '#ffffff') {
-        doc.rect(margins.left, doc.y - 5, doc.page.width - margins.left - margins.right, sectionFontSize + 10)
-          .fill(backgroundColor);
+      if (showTitle) {
+        // Draw section background if enabled
+        if (sectionStyle.showBackground && backgroundColor !== '#ffffff') {
+          doc.rect(margins.left, doc.y - 5, doc.page.width - margins.left - margins.right, sectionFontSize + 10)
+            .fill(backgroundColor);
+        }
+
+        // Section title
+        doc.fontSize(sectionFontSize)
+          .fillColor(primaryColor)
+          .text(sectionLabel, margins.left, doc.y, {
+            align: isRTL ? 'right' : 'left',
+            width: doc.page.width - margins.left - margins.right
+          });
+
+        // Draw border if enabled
+        if (sectionStyle.showBorder !== false) {
+          const borderWidth = sectionStyle.borderWidth || 1;
+          doc.moveTo(margins.left, doc.y + 5)
+            .lineTo(doc.page.width - margins.right, doc.y + 5)
+            .strokeColor(borderColor)
+            .lineWidth(borderWidth)
+            .stroke();
+        }
+
+        doc.y += sectionSpacing / 2;
       }
+    }
 
-      // Section title
-      doc.fontSize(sectionFontSize)
-        .fillColor(primaryColor)
-        .text(sectionLabel, margins.left, doc.y, {
-          align: isRTL ? 'right' : 'left',
-          width: doc.page.width - margins.left - margins.right
-        });
-
-      // Draw border if enabled
-      if (sectionStyle.showBorder !== false) {
-        const borderWidth = sectionStyle.borderWidth || 1;
-        doc.moveTo(margins.left, doc.y + 5)
-          .lineTo(doc.page.width - margins.right, doc.y + 5)
-          .strokeColor(borderColor)
-          .lineWidth(borderWidth)
-          .stroke();
-      }
-
-      doc.y += sectionSpacing / 2;
+    // ── Table Layout ──
+    if (layoutType === 'table' && advancedLayout.table?.enabled && advancedLayout.table?.columns?.length > 0) {
+      this._renderTable(doc, section, values, language, isRTL, pdfStyle, margins);
+      doc.y += sectionSpacing;
+      return;
     }
 
     // Section Fields - Filter visible fields and sort by order
@@ -658,7 +684,6 @@ class PDFGenerator {
               doc.y += fieldSpacing;
             }
           } else {
-            // Image couldn't be loaded
             doc.fontSize(fieldFontSize)
               .fillColor(textColor)
               .font('Helvetica')
@@ -670,7 +695,6 @@ class PDFGenerator {
             doc.y += fieldSpacing;
           }
         } else {
-          // No image value
           doc.fontSize(fieldFontSize)
             .fillColor(textColor)
             .font('Helvetica')
@@ -698,6 +722,21 @@ class PDFGenerator {
       // Format date values
       if (field.type === 'date' && value) {
         displayValue = new Date(value).toLocaleDateString();
+      }
+
+      // Format time values
+      if (field.type === 'time' && value) {
+        displayValue = String(value);
+      }
+
+      // Format datetime values
+      if (field.type === 'datetime' && value) {
+        displayValue = new Date(value).toLocaleString();
+      }
+
+      // Format number values
+      if (field.type === 'number' && value) {
+        displayValue = typeof value === 'number' ? value.toString() : value;
       }
 
       // Field display options
@@ -740,6 +779,188 @@ class PDFGenerator {
     }
 
     doc.y += sectionSpacing;
+  }
+
+  /**
+   * Render a table layout section.
+   */
+  _renderTable(doc, section, values, language, isRTL, pdfStyle, margins) {
+    const advancedLayout = section.advancedLayout || {};
+    const tableConfig = advancedLayout.table || {};
+    const tableColumns = tableConfig.columns || [];
+    const leafColumns = this._getLeafTableColumns(tableColumns);
+    const hasGroupedHeaders = tableColumns.some((col) => Array.isArray(col?.children) && col.children.length > 0);
+
+    if (leafColumns.length === 0) return;
+
+    const textColor = pdfStyle.colors?.text || '#000000';
+    const borderColor = pdfStyle.colors?.border || '#e5e7eb';
+    const fieldFontSize = pdfStyle.fontSize?.field || 10;
+    const availableWidth = doc.page.width - margins.left - margins.right;
+    const colWidth = availableWidth / leafColumns.length;
+    const tableLeft = margins.left;
+    const rowHeight = 22;
+    const headerBgColor = '#f3f4f6';
+    const cellPadding = 4;
+
+    // -- Build rows from values --
+    const rows = [];
+    if (tableConfig.dynamicRows && tableConfig.rowSource) {
+      const fieldKey = `${section.id}.${tableConfig.rowSource}`;
+      const rowData = values.get ? values.get(fieldKey) : values[fieldKey];
+      if (Array.isArray(rowData)) {
+        rows.push(...rowData);
+      }
+    } else {
+      // Static rows — read cell values keyed as sectionId.row_N.col_colId
+      const numberOfRows = tableConfig.numberOfRows || 10;
+      for (let rowIdx = 0; rowIdx < numberOfRows; rowIdx++) {
+        const row = {};
+        let hasData = false;
+        leafColumns.forEach((col, colIdx) => {
+          const colId = col.id || `col${colIdx + 1}`;
+          const cellKey = `${section.id}.row_${rowIdx}.col_${colId}`;
+          const cellValue = values[cellKey];
+          if (cellValue !== undefined && cellValue !== null && cellValue !== '') {
+            hasData = true;
+          }
+          row[colId] = cellValue !== undefined && cellValue !== null && cellValue !== '' ? cellValue : '';
+        });
+        if (hasData || rowIdx === 0) {
+          rows.push(row);
+        }
+      }
+    }
+
+    // -- Header row --
+    let y = doc.y;
+    const headerRowCount = hasGroupedHeaders ? 2 : 1;
+
+    // Draw header background
+    doc.rect(tableLeft, y, availableWidth, rowHeight * headerRowCount)
+      .fill(headerBgColor);
+
+    if (hasGroupedHeaders) {
+      // Row 1: parent columns — compute x position by accumulating leaf widths
+      let parentX = tableLeft;
+      tableColumns.forEach((col) => {
+        const children = Array.isArray(col?.children) ? col.children.filter(Boolean) : [];
+        const childLeaves = children.length > 0 ? this._getLeafTableColumns(children) : [col];
+        const leafCount = childLeaves.length;
+        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
+        const w = colWidth * leafCount;
+        doc.fontSize(fieldFontSize - 1)
+          .fillColor(col.headerStyle?.textColor || textColor)
+          .font('Helvetica-Bold')
+          .text(colLabel, parentX + cellPadding, y + 2, {
+            width: w - cellPadding * 2,
+            align: 'center'
+          });
+        parentX += w;
+      });
+      y += rowHeight;
+
+      // Row 2: child columns
+      doc.rect(tableLeft, y, availableWidth, rowHeight).fill(headerBgColor);
+      leafColumns.forEach((col, colIdx) => {
+        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
+        const x = tableLeft + colIdx * colWidth;
+        doc.fontSize(fieldFontSize - 1)
+          .fillColor(col.headerStyle?.textColor || textColor)
+          .font('Helvetica-Bold')
+          .text(colLabel, x + cellPadding, y + 2, {
+            width: colWidth - cellPadding * 2,
+            align: isRTL ? 'right' : 'left'
+          });
+      });
+    } else {
+      leafColumns.forEach((col, colIdx) => {
+        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
+        const x = tableLeft + colIdx * colWidth;
+        doc.fontSize(fieldFontSize - 1)
+          .fillColor(col.headerStyle?.textColor || textColor)
+          .font('Helvetica-Bold')
+          .text(colLabel, x + cellPadding, y + 2, {
+            width: colWidth - cellPadding * 2,
+            align: isRTL ? 'right' : 'left'
+          });
+      });
+    }
+
+    y += rowHeight;
+
+    // Draw header bottom border
+    doc.moveTo(tableLeft, y)
+      .lineTo(tableLeft + availableWidth, y)
+      .strokeColor(borderColor)
+      .lineWidth(1)
+      .stroke();
+
+    // -- Data rows --
+    if (rows.length === 0) {
+      // Empty message
+      doc.fontSize(fieldFontSize)
+        .fillColor('#9ca3af')
+        .font('Helvetica')
+        .text(language === 'ar' ? 'لا توجد بيانات' : 'No data',
+          tableLeft, y + 8, {
+            align: 'center',
+            width: availableWidth
+          });
+      y += rowHeight;
+    } else {
+      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+        const row = rows[rowIdx];
+
+        // Page break check
+        if (y + rowHeight > doc.page.height - margins.bottom) {
+          doc.addPage();
+          y = margins.top;
+        }
+
+        // Striped background
+        if (tableConfig.stripedRows && rowIdx % 2 === 1) {
+          doc.rect(tableLeft, y, availableWidth, rowHeight).fill('#f9fafb');
+        }
+
+        // Cell values
+        leafColumns.forEach((col, colIdx) => {
+          const colId = col.fieldKey || col.id || `col${colIdx + 1}`;
+          let cellValue = row[colId];
+          if (cellValue === undefined || cellValue === null) cellValue = '-';
+
+          // Simple formatting for date/number types
+          if (col.fieldType === 'date' && cellValue) {
+            try { cellValue = new Date(cellValue).toLocaleDateString(); } catch (e) { /* keep raw */ }
+          }
+          if (col.fieldType === 'boolean') {
+            cellValue = cellValue ? (language === 'ar' ? 'نعم' : 'Yes') : (language === 'ar' ? 'لا' : 'No');
+          }
+
+          const x = tableLeft + colIdx * colWidth;
+          doc.fontSize(fieldFontSize - 1)
+            .fillColor(textColor)
+            .font('Helvetica')
+            .text(String(cellValue), x + cellPadding, y + 3, {
+              width: colWidth - cellPadding * 2,
+              align: isRTL ? 'right' : 'left',
+              lineBreak: false
+            });
+        });
+
+        y += rowHeight;
+
+        // Row separator
+        doc.moveTo(tableLeft, y)
+          .lineTo(tableLeft + availableWidth, y)
+          .strokeColor(borderColor)
+          .lineWidth(0.5)
+          .stroke();
+      }
+    }
+
+    // Move doc.y past the table
+    doc.y = y + 10;
   }
 
   addApprovalSection(doc, formInstance, language, isRTL, pdfStyle, margins) {

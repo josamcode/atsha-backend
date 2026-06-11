@@ -54,7 +54,7 @@ const FORM_INSTANCE_TEMPLATE_DETAIL_SELECT = [
 const FORM_INSTANCE_POPULATE_SUMMARY = [
   {
     path: 'organizationId',
-    select: 'name slug departments branding.displayName'
+    select: 'name slug departments branding'
   },
   {
     path: 'templateId',
@@ -73,7 +73,7 @@ const FORM_INSTANCE_POPULATE_SUMMARY = [
 const FORM_INSTANCE_POPULATE_DETAIL = [
   {
     path: 'organizationId',
-    select: 'name slug departments branding.displayName'
+    select: 'name slug departments branding'
   },
   {
     path: 'templateId',

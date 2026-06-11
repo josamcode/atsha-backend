@@ -147,6 +147,7 @@ app.use('/api/organizations', require('./routes/organizations'));
 app.use('/api/invitations', require('./routes/invitations'));
 app.use('/api/platform', require('./routes/platform'));
 app.use('/api/billing', require('./routes/billing'));
+app.use('/api/media', require('./routes/media'));
 
 // Health check
 app.get('/health', (req, res) => {
