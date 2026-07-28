@@ -125,13 +125,12 @@ const resolveTheme = (template, organization) => {
       fieldSpacing: clampNumber(pdfStyle.spacing?.fieldSpacing, 8, 0, 96),
       lineSpacing: clampNumber(pdfStyle.spacing?.lineSpacing, 1.3, 1, 3)
     },
-    branding: {
-      ...branding,
+    branding: Object.assign({}, branding, {
       logoUrl: branding.logoUrl || orgBranding.logoUrl || '',
       watermarkUrl: branding.watermarkUrl || orgBranding.watermarkUrl || '',
       primaryColor: primary,
       secondaryColor: secondary
-    }
+    })
   };
 };
 
@@ -212,11 +211,10 @@ const resolveTemplateContract = (template, options = {}) => {
     ok: true,
     migrated,
     version: DOCUMENT_VERSION,
-    template: {
-      ...source,
+    template: Object.assign({}, source, {
       sections,
       document: documentValue
-    },
+    }),
     document: documentValue,
     sections,
     sectionsById,

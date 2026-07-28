@@ -180,14 +180,13 @@ const withFieldGrids = (section) => {
     const x = Math.round(clampNumber(grid.x, 0, 0, GRID_COLUMNS - 1));
     const w = Math.round(clampNumber(grid.w, GRID_COLUMNS, 1, GRID_COLUMNS - x));
     const row = Math.round(clampNumber(grid.row, index, 0, 100000));
-    return {
-      ...field,
+    return Object.assign({}, field, {
       grid: { x, w, row },
       width: field?.grid ? widthTokenForColumns(w) : (field?.width || widthTokenForColumns(w))
-    };
+    });
   });
 
-  return { ...section, fields };
+  return Object.assign({}, section, { fields });
 };
 
 /**
@@ -205,7 +204,7 @@ const repairSections = (sections) => {
     .filter((section) => section && typeof section === 'object')
     .map((section, index) => (section.id
       ? section
-      : { ...section, id: `section_recovered_${index}` }));
+      : Object.assign({}, section, { id: `section_recovered_${index}` })));
 };
 
 /**
@@ -365,7 +364,7 @@ const buildDocumentFromLegacy = (template) => {
   return {
     version: DOCUMENT_VERSION,
     page,
-    grid: { ...defaults.grid },
+    grid: Object.assign({}, defaults.grid),
     blocks
   };
 };

@@ -5,6 +5,8 @@
  * `backend/utils/document/` holds a byte-identical mirror produced by
  * `backend/scripts/syncDocumentContract.js`. Keep this file CommonJS and free of
  * any browser or Node specific API so both runtimes can load it unchanged.
+ * Do not use object spread in these CommonJS modules: CRA's production Babel
+ * pass injects an ESM helper for it, and Webpack then rejects `module.exports`.
  *
  * All internal geometry is expressed in PostScript points (pt, 1/72 inch)
  * because that is the unit PDFKit draws in. Author-facing values (page margins,

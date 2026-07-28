@@ -189,7 +189,7 @@ const createBlock = (type, overrides = {}) => {
     return acc;
   }, {});
 
-  return {
+  return Object.assign({
     id: createId('blk'),
     x: 0,
     w: size.w,
@@ -201,15 +201,15 @@ const createBlock = (type, overrides = {}) => {
     keepTogether: blockType === 'signature',
     breakBefore: false,
     repeat: 'all',
-    refId: null,
-    ...provided,
+    refId: null
+  }, provided, {
     type: blockType,
     placement,
-    // Normalised AFTER the spread: a caller-supplied overlay is partial far more
+    // Normalised AFTER the merge: a caller-supplied overlay is partial far more
     // often than not, and letting it through raw produced undefined millimetres.
     overlay: placement === 'overlay' ? normalizeOverlay(provided.overlay, blockType) : null,
-    props: { ...getDefaultBlockProps(blockType), ...(provided.props || {}) }
-  };
+    props: Object.assign({}, getDefaultBlockProps(blockType), provided.props || {})
+  });
 };
 
 const normalizeBlock = (block, index) => {
@@ -222,7 +222,7 @@ const normalizeBlock = (block, index) => {
   const x = Math.round(clampNumber(block?.x, 0, 0, GRID_COLUMNS - 1));
   const w = Math.round(clampNumber(block?.w, defaults.w, 1, GRID_COLUMNS));
 
-  const props = { ...defaultProps, ...(block?.props || {}) };
+  const props = Object.assign({}, defaultProps, block?.props || {});
   if (Object.prototype.hasOwnProperty.call(defaultProps, 'content')) {
     props.content = localized(props.content);
   }
@@ -296,7 +296,7 @@ const compactRows = (blocks) => {
       previousRow = block.row;
       nextRow += 1;
     }
-    return { ...block, row: nextRow };
+    return Object.assign({}, block, { row: nextRow });
   });
 
   return [...repacked, ...others];
