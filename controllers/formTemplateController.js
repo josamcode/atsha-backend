@@ -18,9 +18,75 @@ const {
   assertTemplateUnlocked
 } = require('../utils/subscription');
 const { normalizeDepartmentCode, normalizeRole } = require('../utils/tenantConstants');
+const {
+  DOCUMENT_VERSION,
+  SUPPORTED_DOCUMENT_VERSIONS
+} = require('../utils/document/documentModel');
 
 const DEFAULT_TEMPLATE_VISIBLE_ROLES = ['admin', 'supervisor', 'employee'];
 const DEFAULT_TEMPLATE_EDITABLE_ROLES = ['admin', 'supervisor', 'employee'];
+
+const isPlainObject = (value) => Boolean(value)
+  && typeof value === 'object'
+  && !Array.isArray(value)
+  && !(value instanceof Date);
+
+const toPlain = (value) => {
+  if (value && typeof value.toObject === 'function') {
+    return value.toObject();
+  }
+  return value;
+};
+
+/**
+ * Recursive merge used for `layout` and `pdfStyle` updates.
+ *
+ * The previous one-level spread meant that sending `pdfStyle: { header: {...} }`
+ * REPLACED the whole `header` sub-document, resetting every property the client
+ * did not happen to include back to its schema default. Arrays are replaced
+ * wholesale on purpose — `socialLinks` and `columnWidths` are ordered lists, not
+ * things to merge element-by-element.
+ */
+/** Keys a request body must never be able to reach through a recursive merge. */
+const UNSAFE_MERGE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+const deepMergeConfig = (current, incoming) => {
+  const base = toPlain(current);
+  if (!isPlainObject(incoming)) {
+    return incoming === undefined ? base : incoming;
+  }
+  const result = isPlainObject(base) ? { ...base } : {};
+  Object.keys(incoming).forEach((key) => {
+    if (UNSAFE_MERGE_KEYS.has(key)) {
+      return;
+    }
+    const nextValue = incoming[key];
+    if (isPlainObject(nextValue)) {
+      result[key] = deepMergeConfig(result[key], nextValue);
+      return;
+    }
+    result[key] = nextValue;
+  });
+  return result;
+};
+
+/**
+ * Guard against a client that was built against a newer layout schema. Saving a
+ * document this server cannot render would leave the template unopenable, so
+ * reject it with an explicit, actionable message instead.
+ */
+const assertRenderableDocument = (documentValue) => {
+  if (documentValue === undefined || documentValue === null) {
+    return;
+  }
+  const version = Number(documentValue.version);
+  if (Number.isFinite(version) && !SUPPORTED_DOCUMENT_VERSIONS.includes(version)) {
+    throw createHttpError(
+      400,
+      `Unsupported document layout version ${version}. This server supports version(s) ${SUPPORTED_DOCUMENT_VERSIONS.join(', ')}. Please update the application.`
+    );
+  }
+};
 
 const sendControllerError = (res, error) => {
   if (error.code === 11000) {
@@ -46,6 +112,10 @@ const sendControllerError = (res, error) => {
 const getTemplateById = (templateId) => (
   FormTemplate.findById(templateId).populate('createdBy', 'name email department role')
 );
+
+// Exported for the persistence tests; not part of the HTTP surface.
+exports.deepMergeConfig = deepMergeConfig;
+exports.assertRenderableDocument = assertRenderableDocument;
 
 const ensureTemplateReadAccess = (req, template) => {
   const normalizedRole = normalizeRole(req.user.role);
@@ -201,11 +271,15 @@ exports.createFormTemplate = async (req, res) => {
       editableByRoles,
       departments,
       requiresApproval,
+      isActive,
       layout,
-      pdfStyle
+      pdfStyle,
+      document: documentValue,
+      layoutVersion
     } = req.body;
 
     await assertTemplateCreationAvailable(organization);
+    assertRenderableDocument(documentValue);
 
     const template = await FormTemplate.create(attachOrganizationId({
       title,
@@ -225,8 +299,11 @@ exports.createFormTemplate = async (req, res) => {
         { fallbackDepartments: ['all'], defaultAll: true }
       ),
       requiresApproval: requiresApproval !== undefined ? requiresApproval : true,
+      isActive: isActive !== undefined ? isActive : true,
       layout: layout || {},
       pdfStyle: pdfStyle || {},
+      document: documentValue || undefined,
+      layoutVersion: documentValue ? DOCUMENT_VERSION : (layoutVersion || 1),
       createdBy: req.user.id
     }, organization));
 
@@ -281,8 +358,12 @@ exports.updateFormTemplate = async (req, res) => {
       requiresApproval,
       isActive,
       layout,
-      pdfStyle
+      pdfStyle,
+      document: documentValue,
+      layoutVersion
     } = req.body;
+
+    assertRenderableDocument(documentValue);
 
     if (title !== undefined) template.title = title;
     if (description !== undefined) template.description = description;
@@ -303,16 +384,18 @@ exports.updateFormTemplate = async (req, res) => {
     if (requiresApproval !== undefined) template.requiresApproval = requiresApproval;
     if (isActive !== undefined) template.isActive = isActive;
     if (layout !== undefined) {
-      template.layout = {
-        ...(template.layout?.toObject ? template.layout.toObject() : template.layout || {}),
-        ...(layout || {})
-      };
+      template.layout = deepMergeConfig(template.layout, layout || {});
     }
     if (pdfStyle !== undefined) {
-      template.pdfStyle = {
-        ...(template.pdfStyle?.toObject ? template.pdfStyle.toObject() : template.pdfStyle || {}),
-        ...(pdfStyle || {})
-      };
+      template.pdfStyle = deepMergeConfig(template.pdfStyle, pdfStyle || {});
+    }
+    if (documentValue !== undefined) {
+      // The visual document is an ordered block list: a merge would resurrect
+      // deleted blocks, so it is replaced wholesale.
+      template.document = documentValue;
+      template.layoutVersion = DOCUMENT_VERSION;
+    } else if (layoutVersion !== undefined) {
+      template.layoutVersion = layoutVersion;
     }
 
     await template.save();
@@ -409,6 +492,8 @@ exports.duplicateFormTemplate = async (req, res) => {
       requiresApproval: originalTemplate.requiresApproval,
       layout: originalTemplate.layout,
       pdfStyle: originalTemplate.pdfStyle,
+      document: originalTemplate.document ? toPlain(originalTemplate.document) : undefined,
+      layoutVersion: originalTemplate.layoutVersion,
       isActive: originalTemplate.isActive,
       createdBy: req.user.id
     }, organization));

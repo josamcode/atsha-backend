@@ -4,6 +4,24 @@ const {
   isValidDepartmentCode,
   normalizeDepartmentCode
 } = require('../utils/tenantConstants');
+const {
+  DOCUMENT_VERSION,
+  SUPPORTED_DOCUMENT_VERSIONS,
+  BLOCK_TYPES,
+  PLACEMENTS,
+  REPEAT_MODES,
+  GRID_COLUMNS
+} = require('../utils/document/documentModel');
+const { PAGE_SIZE_VALUES, ORIENTATION_VALUES } = require('../utils/document/units');
+
+/**
+ * Mongoose runs in strict mode, so any property that is not declared here is
+ * silently discarded on save. Every property the Template Builder produces is
+ * therefore declared explicitly — the round-trip test in
+ * `__tests__/formTemplateSchema.test.js` fails if the two ever drift again.
+ */
+
+const localizedString = () => ({ en: String, ar: String });
 
 const fieldSchema = new mongoose.Schema({
   key: {
@@ -19,31 +37,30 @@ const fieldSchema = new mongoose.Schema({
     enum: ['text', 'textarea', 'static_text', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'image', 'file'],
     required: true
   },
-  defaultValue: {
-    en: String,
-    ar: String
-  },
-  options: [{
-    en: String,
-    ar: String
-  }],
+  defaultValue: localizedString(),
+  options: [localizedString()],
   required: {
     type: Boolean,
     default: false
   },
-  placeholder: {
-    en: String,
-    ar: String
-  },
+  placeholder: localizedString(),
   // Layout and positioning
   order: {
     type: Number,
     default: 0
   },
+  // Legacy semantic width token. Kept in sync with `grid.w` so older clients and
+  // any external consumer keep working after a save from the new builder.
   width: {
     type: String,
     enum: ['full', 'half', 'third', 'two-thirds', 'quarter', 'three-quarters'],
     default: 'full'
+  },
+  // Layout-v2 placement inside the section's 24-column grid.
+  grid: {
+    x: { type: Number, default: 0, min: 0, max: GRID_COLUMNS - 1 },
+    w: { type: Number, default: GRID_COLUMNS, min: 1, max: GRID_COLUMNS },
+    row: { type: Number, default: 0, min: 0 }
   },
   visible: {
     type: Boolean,
@@ -93,11 +110,13 @@ const fieldSchema = new mongoose.Schema({
 
 const tableColumnBaseDefinition = {
   id: String,
-  label: { en: String, ar: String },
+  label: localizedString(),
   fieldKey: String,
   fieldType: {
     type: String,
-    enum: ['text', 'textarea', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'file'],
+    // `image` and `static_text` were selectable in the builder but rejected here,
+    // which failed the whole save with a validation error.
+    enum: ['text', 'textarea', 'static_text', 'number', 'boolean', 'select', 'date', 'time', 'datetime', 'image', 'file'],
     default: 'text'
   },
   width: { type: String, default: 'auto' },
@@ -110,18 +129,19 @@ const tableColumnBaseDefinition = {
   }
 };
 
-const tableChildColumnSchema = new mongoose.Schema(tableColumnBaseDefinition, {
-  _id: false,
-  id: false
-});
+const subSchemaOptions = { _id: false, id: false };
 
+// Three levels of grouping. The previous two-level cap silently deleted any
+// deeper grouping the builder allowed the author to create.
+const tableGrandChildColumnSchema = new mongoose.Schema(tableColumnBaseDefinition, subSchemaOptions);
+const tableChildColumnSchema = new mongoose.Schema({
+  ...tableColumnBaseDefinition,
+  children: [tableGrandChildColumnSchema]
+}, subSchemaOptions);
 const tableColumnSchema = new mongoose.Schema({
   ...tableColumnBaseDefinition,
   children: [tableChildColumnSchema]
-}, {
-  _id: false,
-  id: false
-});
+}, subSchemaOptions);
 
 const footerSocialLinkSchema = new mongoose.Schema({
   id: {
@@ -137,10 +157,7 @@ const footerSocialLinkSchema = new mongoose.Schema({
     type: String,
     trim: true
   }
-}, {
-  _id: false,
-  id: false
-});
+}, subSchemaOptions);
 
 const sectionSchema = new mongoose.Schema({
   id: {
@@ -164,7 +181,8 @@ const sectionSchema = new mongoose.Schema({
   // Section type for special handling (header, footer, signature, etc.)
   sectionType: {
     type: String,
-    enum: ['normal', 'header', 'footer', 'signature', 'stamp', 'totals', 'notes'],
+    // `approval` is offered by the builder; rejecting it here failed the save.
+    enum: ['normal', 'header', 'footer', 'signature', 'approval', 'stamp', 'totals', 'notes'],
     default: 'normal'
   },
   // PDF-specific styling
@@ -193,7 +211,24 @@ const sectionSchema = new mongoose.Schema({
       rowSource: String, // Field key that contains array of items
       showHeader: { type: Boolean, default: true },
       showBorders: { type: Boolean, default: true },
-      stripedRows: { type: Boolean, default: false }
+      stripedRows: { type: Boolean, default: false },
+      // Previously dropped on save: the builder let authors set these and the
+      // value never survived a reload.
+      numberOfRows: { type: Number, default: 6, min: 0, max: 500 },
+      borderStyle: { type: String, enum: ['solid', 'dashed', 'dotted', 'double', 'none'], default: 'solid' },
+      borderColor: { type: String, default: '#d1d5db' },
+      borderWidth: { type: Number, default: 1 },
+      headerStyle: {
+        backgroundColor: { type: String, default: '#f3f4f6' },
+        textColor: { type: String, default: '#111827' },
+        fontSize: { type: Number, default: 12 },
+        bold: { type: Boolean, default: true }
+      },
+      cellStyle: {
+        backgroundColor: { type: String, default: '#ffffff' },
+        textColor: { type: String, default: '#111827' },
+        fontSize: { type: Number, default: 11 }
+      }
     },
     // Column layout configuration
     columns: {
@@ -251,6 +286,114 @@ const sectionSchema = new mongoose.Schema({
   }
 });
 
+/* ------------------------------------------------------------------------- */
+/* Layout v2 document                                                         */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Union of every block type's props. Declaring them explicitly (rather than
+ * using `Mixed`) keeps validation, defaults and change tracking working, which
+ * is exactly what the old `Mixed`-free schema got right and the drifting
+ * sub-objects got wrong.
+ */
+const blockPropsSchema = new mongoose.Schema({
+  // text
+  content: localizedString(),
+  fontSize: Number,
+  bold: Boolean,
+  italic: Boolean,
+  align: { type: String, enum: ['start', 'end', 'left', 'center', 'right', 'justify'] },
+  color: String,
+  backgroundColor: String,
+  lineSpacing: Number,
+  // divider
+  thickness: Number,
+  style: { type: String, enum: ['solid', 'dashed', 'dotted'] },
+  insetMm: Number,
+  // image / stamp / watermark
+  url: String,
+  fit: { type: String, enum: ['cover', 'contain', 'fill'] },
+  borderRadius: Number,
+  borderWidth: Number,
+  borderColor: String,
+  opacity: Number,
+  rotation: Number,
+  sizePercent: Number,
+  label: localizedString(),
+  // qr
+  value: String,
+  foreground: String,
+  background: String,
+  caption: localizedString()
+}, subSchemaOptions);
+
+const blockOverlaySchema = new mongoose.Schema({
+  pageScope: { type: String, enum: ['all', 'first'], default: 'all' },
+  xMm: { type: Number, default: 20 },
+  yMm: { type: Number, default: 20 },
+  wMm: { type: Number, default: 40 },
+  hMm: { type: Number, default: 40 },
+  rotation: { type: Number, default: 0 },
+  opacity: { type: Number, default: 100, min: 0, max: 100 }
+}, subSchemaOptions);
+
+const documentBlockSchema = new mongoose.Schema({
+  id: { type: String, required: true },
+  type: { type: String, enum: BLOCK_TYPES, required: true },
+  placement: { type: String, enum: PLACEMENTS, default: 'flow' },
+  x: { type: Number, default: 0, min: 0, max: GRID_COLUMNS - 1 },
+  w: { type: Number, default: GRID_COLUMNS, min: 1, max: GRID_COLUMNS },
+  row: { type: Number, default: 0, min: 0 },
+  heightMm: { type: Number, default: null },
+  minHeightMm: { type: Number, default: 0 },
+  hidden: { type: Boolean, default: false },
+  locked: { type: Boolean, default: false },
+  keepTogether: { type: Boolean, default: false },
+  breakBefore: { type: Boolean, default: false },
+  repeat: { type: String, enum: REPEAT_MODES, default: 'all' },
+  refId: { type: String, default: null },
+  overlay: { type: blockOverlaySchema, default: null },
+  props: { type: blockPropsSchema, default: () => ({}) }
+}, subSchemaOptions);
+
+const documentSchema = new mongoose.Schema({
+  /**
+   * Refuse to persist a document this build cannot render. A field validator
+   * (rather than a `pre('validate')` hook) is used deliberately so the rejection
+   * also fires for `validateSync()`, which skips middleware.
+   */
+  version: {
+    type: Number,
+    default: DOCUMENT_VERSION,
+    validate: {
+      validator: (value) => value === undefined
+        || value === null
+        || SUPPORTED_DOCUMENT_VERSIONS.includes(Number(value)),
+      message: (props) => `Unsupported document layout version ${props.value}. Supported versions: ${SUPPORTED_DOCUMENT_VERSIONS.join(', ')}.`
+    }
+  },
+  page: {
+    size: { type: String, enum: PAGE_SIZE_VALUES, default: 'A4' },
+    orientation: { type: String, enum: ORIENTATION_VALUES, default: 'portrait' },
+    // Millimetres — the unit template authors work in and the unit the canvas,
+    // preview and PDF all consume. (Legacy `layout.margins` are PDF points.)
+    margins: {
+      top: { type: Number, default: 14, min: 0, max: 100 },
+      right: { type: Number, default: 12, min: 0, max: 100 },
+      bottom: { type: Number, default: 14, min: 0, max: 100 },
+      left: { type: Number, default: 12, min: 0, max: 100 }
+    }
+  },
+  grid: {
+    columns: { type: Number, default: GRID_COLUMNS },
+    gutterMm: { type: Number, default: 3, min: 0, max: 20 },
+    rowGapMm: { type: Number, default: 3, min: 0, max: 40 },
+    snap: { type: Boolean, default: true },
+    showGrid: { type: Boolean, default: true }
+  },
+  blocks: [documentBlockSchema]
+}, subSchemaOptions);
+
 const formTemplateSchema = new mongoose.Schema({
   organizationId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -261,10 +404,7 @@ const formTemplateSchema = new mongoose.Schema({
     en: { type: String, required: true },
     ar: { type: String, required: true }
   },
-  description: {
-    en: String,
-    ar: String
-  },
+  description: localizedString(),
   sections: [sectionSchema],
   visibleToRoles: [{
     type: String,
@@ -297,21 +437,37 @@ const formTemplateSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
-  // Layout configuration
+  /**
+   * 1 = legacy flow-only template (adapted at read time, never rewritten until
+   * the author saves). 2 = designed in the visual builder.
+   */
+  layoutVersion: {
+    type: Number,
+    default: 1,
+    min: 1
+  },
+  // Visual document definition (layout v2).
+  document: {
+    type: documentSchema,
+    default: undefined
+  },
+  // Legacy layout configuration. Retained so templates saved by the new builder
+  // stay readable by any consumer that has not been updated yet.
   layout: {
     // Section ordering and visibility
     sectionOrder: [String], // Array of section IDs in display order
     // PDF page settings
     pageSize: {
       type: String,
-      enum: ['A4', 'Letter', 'Legal'],
+      enum: PAGE_SIZE_VALUES,
       default: 'A4'
     },
     orientation: {
       type: String,
-      enum: ['portrait', 'landscape'],
+      enum: ORIENTATION_VALUES,
       default: 'portrait'
     },
+    // PDF points (kept for backward compatibility; `document.page.margins` is mm)
     margins: {
       top: { type: Number, default: 50 },
       right: { type: Number, default: 50 },
@@ -329,9 +485,16 @@ const formTemplateSchema = new mongoose.Schema({
       showDate: { type: Boolean, default: true },
       showCompanyName: { type: Boolean, default: true },
       showCompanyAddress: { type: Boolean, default: true },
+      // Previously dropped on save.
+      showSubtitle: { type: Boolean, default: false },
+      subtitle: localizedString(),
+      titleStyle: { type: String, default: 'normal' },
+      titleColor: { type: String, default: '' },
+      decorativeLineColor: { type: String, default: '' },
+      dashedBorder: { type: Boolean, default: false },
       layout: {
         type: String,
-        enum: ['default', 'split'], // default: logo+company left, form title right | split: logo+company left, form title right
+        enum: ['default', 'split'],
         default: 'default'
       },
       height: { type: Number, default: 80 },
@@ -385,11 +548,10 @@ const formTemplateSchema = new mongoose.Schema({
       fontSize: { type: Number, default: 8 },
       phoneNumber: String,
       qrCodeValue: String,
+      // Previously dropped on save.
+      companyName: String,
       socialLinks: [footerSocialLinkSchema],
-      content: {
-        en: String,
-        ar: String
-      }
+      content: localizedString()
     },
     // Branding
     branding: {
@@ -399,14 +561,8 @@ const formTemplateSchema = new mongoose.Schema({
       watermarkUrl: String,
       watermarkSize: { type: Number, default: 55 },
       watermarkOpacity: { type: Number, default: 5 },
-      companyName: {
-        en: String,
-        ar: String
-      },
-      companyAddress: {
-        en: String,
-        ar: String
-      },
+      companyName: localizedString(),
+      companyAddress: localizedString(),
       companyPhone: String,
       companyEmail: String
     },
@@ -422,6 +578,8 @@ const formTemplateSchema = new mongoose.Schema({
     },
     colors: {
       primary: { type: String, default: '#d4b900' },
+      // Previously dropped on save.
+      secondary: { type: String, default: '' },
       text: { type: String, default: '#000000' },
       border: { type: String, default: '#e5e7eb' },
       background: { type: String, default: '#ffffff' }
@@ -453,6 +611,14 @@ const formTemplateSchema = new mongoose.Schema({
   timestamps: true
 });
 
+/** A template carrying a visual document is by definition layout v2. */
+formTemplateSchema.pre('validate', function syncLayoutVersion(next) {
+  if (this.document && Number(this.layoutVersion) !== DOCUMENT_VERSION) {
+    this.layoutVersion = DOCUMENT_VERSION;
+  }
+  return next();
+});
+
 // Index for faster queries
 formTemplateSchema.index({ organizationId: 1, createdBy: 1, createdAt: -1 });
 formTemplateSchema.index({ organizationId: 1, departments: 1, isActive: 1 });
@@ -460,4 +626,3 @@ formTemplateSchema.index({ organizationId: 1, isActive: 1, createdAt: -1 });
 formTemplateSchema.index({ 'title.en': 'text', 'title.ar': 'text' });
 
 module.exports = mongoose.model('FormTemplate', formTemplateSchema);
-

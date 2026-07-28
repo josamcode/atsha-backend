@@ -5,6 +5,77 @@ const https = require('https');
 const http = require('http');
 const QRCode = require('qrcode');
 
+const { layoutDocument } = require('./document/layoutEngine');
+const { resolveTemplateContract } = require('./document/templateContract');
+const { containsArabic } = require('./document/textMetrics');
+
+/**
+ * Server-side PDF generation.
+ *
+ * This module no longer implements its own layout. `document/layoutEngine`
+ * produces a paginated list of absolutely positioned draw primitives, and this
+ * file is a thin PDFKit executor for them — exactly the same primitives the
+ * browser canvas, the preview and the print view execute. That is what makes
+ * "what you designed" and "what you downloaded" the same document by
+ * construction rather than by two implementations agreeing.
+ */
+
+const MAX_IMAGE_BYTES = Number(process.env.PDF_MAX_IMAGE_BYTES) || 8 * 1024 * 1024;
+const IMAGE_TIMEOUT_MS = Number(process.env.PDF_IMAGE_TIMEOUT_MS) || 12000;
+const MAX_CONCURRENT_IMAGE_LOADS = 4;
+/** Whole-document budgets, so one template cannot exhaust the export worker. */
+const MAX_TOTAL_IMAGE_BYTES = Number(process.env.PDF_MAX_TOTAL_IMAGE_BYTES) || 48 * 1024 * 1024;
+const MAX_DISTINCT_IMAGES = Number(process.env.PDF_MAX_IMAGES) || 60;
+/** Absolute ceiling on a single fetch, independent of socket inactivity. */
+const IMAGE_TOTAL_TIMEOUT_MS = Number(process.env.PDF_IMAGE_TOTAL_TIMEOUT_MS) || 20000;
+
+const UPLOADS_ROOT = path.resolve(__dirname, '..', 'uploads');
+
+/**
+ * Hosts that must never be fetched server-side.
+ *
+ * Image URLs arrive from template branding AND from submitted form values, so
+ * they are attacker-controlled: without this an employee could point a field at
+ * a cloud metadata endpoint or an internal service and read the response through
+ * the exported PDF. Mirrors the policy already enforced by `routes/media.js`.
+ */
+const BLOCKED_HOST_PATTERNS = [
+  /^localhost$/i,
+  /^127\./,
+  /^0\.0\.0\.0$/,
+  /^\[?::1\]?$/,
+  /^169\.254\./,
+  /^10\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /\.local$/i,
+  /\.internal$/i,
+  /^metadata\./i
+];
+
+const isBlockedHost = (hostname) => {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return BLOCKED_HOST_PATTERNS.some((pattern) => pattern.test(host));
+};
+
+/** True when the URL is safe for the server to fetch. */
+const isFetchableUrl = (value) => {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return false;
+    }
+    return !isBlockedHost(parsed.hostname);
+  } catch (error) {
+    return false;
+  }
+};
+
+const ARABIC_REGULAR_PATH = process.env.PDF_ARABIC_FONT_PATH
+  || path.join(__dirname, '..', 'fonts', 'NotoSansArabic-Regular.ttf');
+const ARABIC_BOLD_PATH = process.env.PDF_ARABIC_BOLD_FONT_PATH
+  || path.join(__dirname, '..', 'fonts', 'NotoSansArabic-Bold.ttf');
+
 const clampNumber = (value, fallback, min, max) => {
   const numericValue = Number(value);
 
@@ -17,42 +88,86 @@ const clampNumber = (value, fallback, min, max) => {
 
 /**
  * Download an image from a URL and return it as a Buffer.
- * Follows redirects (max 3 hops).
+ * Follows redirects (max 3 hops), enforces a hard byte budget and actually tears
+ * down a stalled socket — the previous `timeout` option only armed an event.
  */
-const downloadImage = (url, redirectCount = 0) => {
-  return new Promise((resolve, reject) => {
-    if (redirectCount > 3) {
-      return reject(new Error('Too many redirects'));
+const downloadImage = (url, redirectCount = 0, deadline = Date.now() + IMAGE_TOTAL_TIMEOUT_MS) => new Promise((resolve, reject) => {
+  if (redirectCount > 3) {
+    reject(new Error('Too many redirects'));
+    return;
+  }
+  // Re-checked on every hop: a redirect is the classic way to smuggle a request
+  // to an internal host past a check that only ran on the first URL.
+  if (!isFetchableUrl(url)) {
+    reject(new Error(`Refusing to fetch ${url}: host is not allowed`));
+    return;
+  }
+  if (Date.now() > deadline) {
+    reject(new Error(`Timed out downloading image from ${url}`));
+    return;
+  }
+
+  const client = String(url).startsWith('https') ? https : http;
+  const overallTimer = setTimeout(() => {
+    // eslint-disable-next-line no-use-before-define
+    request.destroy(new Error(`Timed out downloading image from ${url}`));
+  }, Math.max(1, deadline - Date.now()));
+
+  const request = client.get(url, { timeout: IMAGE_TIMEOUT_MS }, (response) => {
+    if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+      response.resume();
+      clearTimeout(overallTimer);
+      const next = new URL(response.headers.location, url).toString();
+      downloadImage(next, redirectCount + 1, deadline).then(resolve).catch(reject);
+      return;
     }
 
-    const client = String(url).startsWith('https') ? https : http;
+    if (response.statusCode !== 200) {
+      response.resume();
+      reject(new Error(`Failed to download image from ${url}: HTTP ${response.statusCode}`));
+      return;
+    }
 
-    client.get(url, { timeout: 15000 }, (response) => {
-      // Follow redirects
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        const redirectUrl = response.headers.location;
-        downloadImage(redirectUrl, redirectCount + 1).then(resolve).catch(reject);
+    const declaredLength = Number(response.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_BYTES) {
+      response.destroy();
+      reject(new Error(`Image at ${url} exceeds the ${MAX_IMAGE_BYTES} byte budget`));
+      return;
+    }
+
+    const chunks = [];
+    let received = 0;
+    response.on('data', (chunk) => {
+      received += chunk.length;
+      if (received > MAX_IMAGE_BYTES) {
+        response.destroy();
+        reject(new Error(`Image at ${url} exceeds the ${MAX_IMAGE_BYTES} byte budget`));
         return;
       }
-
-      if (response.statusCode !== 200) {
-        return reject(new Error(`Failed to download image from ${url}: HTTP ${response.statusCode}`));
-      }
-
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => resolve(Buffer.concat(chunks)));
-      response.on('error', reject);
-    }).on('error', (err) => {
-      // If the URL is a local path being treated as remote, don't crash
-      reject(err);
+      chunks.push(chunk);
+    });
+    response.on('end', () => {
+      clearTimeout(overallTimer);
+      resolve(Buffer.concat(chunks));
+    });
+    response.on('error', (error) => {
+      clearTimeout(overallTimer);
+      reject(error);
     });
   });
-};
+
+  request.on('timeout', () => {
+    request.destroy(new Error(`Timed out downloading image from ${url}`));
+  });
+  request.on('error', (error) => {
+    clearTimeout(overallTimer);
+    reject(error);
+  });
+});
 
 /**
  * Resolve an image path/URL to a Buffer suitable for PDFKit.
- * Handles: absolute URLs, /uploads/* local paths, /logo.png static files, data URIs.
+ * Handles: absolute URLs, /uploads/* local paths, static files, data URIs.
  */
 const resolveAndLoadImage = async (imageUrl) => {
   if (!imageUrl) {
@@ -63,10 +178,15 @@ const resolveAndLoadImage = async (imageUrl) => {
 
   // Data URI — PDFKit can handle these directly
   if (urlStr.startsWith('data:')) {
+    // PDFKit cannot decode SVG; the preview placeholder uses one, so skip it
+    // rather than throwing in the middle of a page.
+    if (/^data:image\/svg\+xml/i.test(urlStr)) {
+      return null;
+    }
     return urlStr;
   }
 
-  // Absolute URL — download it
+  // Absolute URL — download it (host-checked, redirect-checked, size-capped)
   if (/^https?:\/\//i.test(urlStr)) {
     try {
       return await downloadImage(urlStr);
@@ -76,60 +196,73 @@ const resolveAndLoadImage = async (imageUrl) => {
     }
   }
 
-  // Local filesystem path (e.g. /uploads/image-xxx.jpg)
-  if (urlStr.startsWith('/uploads/')) {
-    const localPath = path.join(__dirname, '..', urlStr);
-    try {
-      if (fs.existsSync(localPath)) {
-        return fs.readFileSync(localPath);
-      }
-    } catch (err) {
-      console.warn(`[pdfGenerator] Failed to read local file ${localPath}:`, err.message);
-    }
-    // Fallback: try to download from localhost
-    const port = process.env.PORT || 5000;
-    try {
-      return await downloadImage(`http://localhost:${port}${urlStr}`);
-    } catch (err) {
-      console.warn(`[pdfGenerator] Failed to download image from localhost:`, err.message);
-      return null;
-    }
-  }
-
-  // Static files from frontend (e.g. /logo.png, /stamp.png)
-  // Try frontend public directory first, then backend uploads
-  const frontendPublicPath = path.join(__dirname, '..', '..', 'frontend', 'public', urlStr.replace(/^\//, ''));
-  try {
-    if (fs.existsSync(frontendPublicPath)) {
-      return fs.readFileSync(frontendPublicPath);
-    }
-  } catch (err) {
-    // ignore
-  }
-
-  const backendUploadsPath = path.join(__dirname, '..', 'uploads', urlStr.replace(/^\/uploads\//, ''));
-  try {
-    if (fs.existsSync(backendUploadsPath)) {
-      return fs.readFileSync(backendUploadsPath);
-    }
-  } catch (err) {
-    // ignore
-  }
-
-  // Last resort: try to download from localhost
-  const port = process.env.PORT || 5000;
-  try {
-    return await downloadImage(`http://localhost:${port}${urlStr.startsWith('/') ? urlStr : `/${urlStr}`}`);
-  } catch (err) {
-    console.warn(`[pdfGenerator] Failed to resolve image ${urlStr}:`, err.message);
+  /**
+   * Local files. The path is resolved and then CONTAINED inside `uploads/`:
+   * image references come from submitted form values, so `/uploads/../../..`
+   * would otherwise read any file the process can see and embed it in the PDF.
+   */
+  const relative = urlStr.replace(/^\/+/, '').replace(/^uploads\//, '');
+  const resolved = path.resolve(UPLOADS_ROOT, relative);
+  if (resolved !== UPLOADS_ROOT && !resolved.startsWith(UPLOADS_ROOT + path.sep)) {
+    console.warn(`[pdfGenerator] Refusing to read ${urlStr}: outside the uploads directory`);
     return null;
   }
+
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      const stats = fs.statSync(resolved);
+      if (stats.size > MAX_IMAGE_BYTES) {
+        console.warn(`[pdfGenerator] Skipping ${urlStr}: exceeds the image size budget`);
+        return null;
+      }
+      return fs.readFileSync(resolved);
+    }
+  } catch (err) {
+    console.warn(`[pdfGenerator] Failed to read local file ${resolved}:`, err.message);
+  }
+
+  return null;
+};
+
+/** Run `worker` over `items` with a bounded number of in-flight promises. */
+const mapWithConcurrency = async (items, limit, worker) => {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      // eslint-disable-next-line no-await-in-loop
+      results[index] = await worker(items[index], index);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
+};
+
+const normalizeColor = (value, fallback = null) => {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'transparent') return fallback;
+  // PDFKit accepts #rgb/#rrggbb and named colours but not rgba(); drop the alpha.
+  const rgba = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i.exec(trimmed);
+  if (rgba) {
+    const toHex = (component) => Math.max(0, Math.min(255, Math.round(Number(component))))
+      .toString(16)
+      .padStart(2, '0');
+    return `#${toHex(rgba[1])}${toHex(rgba[2])}${toHex(rgba[3])}`;
+  }
+  return trimmed;
 };
 
 class PDFGenerator {
   constructor() {
-    // Path to Arabic font (you'll need to add an Arabic font file)
-    this.arabicFontPath = path.join(__dirname, '../fonts/NotoSansArabic-Regular.ttf');
+    this.arabicFontPath = ARABIC_REGULAR_PATH;
+    this.arabicBoldFontPath = ARABIC_BOLD_PATH;
+    this.warnedMissingArabicFont = false;
   }
 
   buildPdfStyle(template = {}, organization = null) {
@@ -150,8 +283,8 @@ class PDFGenerator {
           ar: templateBranding.companyName?.ar || organizationDisplayName
         },
         companyAddress: {
-          en: templateBranding.companyAddress?.en || organizationBranding.legalName || organizationDisplayName,
-          ar: templateBranding.companyAddress?.ar || organizationBranding.legalName || organizationDisplayName
+          en: templateBranding.companyAddress?.en || organizationBranding.legalName || '',
+          ar: templateBranding.companyAddress?.ar || organizationBranding.legalName || ''
         },
         watermarkUrl: templateBranding.watermarkUrl || organizationBranding.watermarkUrl,
         companyPhone: templateBranding.companyPhone || organizationBranding.supportPhone,
@@ -175,1054 +308,396 @@ class PDFGenerator {
     return departmentCode || '-';
   }
 
-  async generateFormPDF(formInstance, template, user, language = 'en', options = {}) {
-    // Build pdfStyle and load images (logo + watermark) upfront before creating the doc
-    const layout = template.layout || {};
-    const pdfStyle = this.buildPdfStyle(template, options.organization || null);
-    const branding = pdfStyle.branding || {};
+  /**
+   * Register the embedded Arabic faces. PDFKit's built-in Type1 fonts are
+   * WinAnsi-only and carry no Arabic glyphs or shaping tables; fontkit shapes
+   * Arabic correctly once a real TTF is registered.
+   */
+  registerFonts(doc) {
+    const available = { arabic: false, arabicBold: false };
 
-    // Pre-load watermark image
-    const watermarkConfig = branding.watermarkConfig || pdfStyle.watermark || {};
-    const watermarkUrl = branding.watermarkUrl || branding.logoUrl;
-    const watermarkEnabled = watermarkConfig.enabled !== false && !!watermarkUrl;
-    let watermarkBuffer = null;
-    if (watermarkEnabled) {
-      watermarkBuffer = await resolveAndLoadImage(watermarkUrl);
+    try {
+      if (fs.existsSync(this.arabicFontPath)) {
+        doc.registerFont('Arabic', this.arabicFontPath);
+        available.arabic = true;
+      }
+      if (fs.existsSync(this.arabicBoldFontPath)) {
+        doc.registerFont('Arabic-Bold', this.arabicBoldFontPath);
+        available.arabicBold = true;
+      }
+    } catch (error) {
+      console.warn('[pdfGenerator] Could not register the Arabic font:', error.message);
     }
 
-    return new Promise(async (resolve, reject) => {
+    if (!available.arabic && !this.warnedMissingArabicFont) {
+      this.warnedMissingArabicFont = true;
+      console.warn(
+        `[pdfGenerator] Arabic font not found at ${this.arabicFontPath}. `
+        + 'Arabic text will fall back to Helvetica and will not render correctly. '
+        + 'Set PDF_ARABIC_FONT_PATH or ship fonts/NotoSansArabic-Regular.ttf.'
+      );
+    }
+
+    return available;
+  }
+
+  /** Pick a face per line: Noto Sans Arabic also covers Latin, so mixed lines are safe. */
+  selectFont(doc, text, bold, fonts) {
+    if (containsArabic(text) && fonts.arabic) {
+      doc.font(bold && fonts.arabicBold ? 'Arabic-Bold' : 'Arabic');
+      return;
+    }
+    doc.font(bold ? 'Helvetica-Bold' : 'Helvetica');
+  }
+
+  /** Collect every distinct image source and QR value so they load once, in parallel. */
+  async preloadAssets(pages) {
+    const imageSources = new Set();
+    const qrEntries = new Map();
+
+    pages.forEach((page) => {
+      page.primitives.forEach((primitive) => {
+        if (primitive.k === 'image' && primitive.src) {
+          imageSources.add(primitive.src);
+        }
+        if (primitive.k === 'qr' && primitive.value) {
+          const key = `${primitive.value}|${primitive.foreground}|${primitive.background}|${Math.round(primitive.size)}`;
+          if (!qrEntries.has(key)) {
+            qrEntries.set(key, primitive);
+          }
+        }
+      });
+    });
+
+    // Bound both the count and the total bytes held in memory at once: the
+    // per-image cap alone still allows an arbitrary number of images.
+    const allSources = [...imageSources];
+    const sources = allSources.slice(0, MAX_DISTINCT_IMAGES);
+    if (allSources.length > sources.length) {
+      console.warn(
+        `[pdfGenerator] Document references ${allSources.length} distinct images; `
+        + `only the first ${MAX_DISTINCT_IMAGES} are embedded.`
+      );
+    }
+
+    const loaded = await mapWithConcurrency(sources, MAX_CONCURRENT_IMAGE_LOADS, (src) => resolveAndLoadImage(src));
+    const images = new Map();
+    let totalBytes = 0;
+    sources.forEach((src, index) => {
+      const buffer = loaded[index];
+      if (!buffer) return;
+      const size = Buffer.isBuffer(buffer) ? buffer.length : String(buffer).length;
+      if (totalBytes + size > MAX_TOTAL_IMAGE_BYTES) {
+        console.warn(`[pdfGenerator] Image budget exhausted; skipping ${src}`);
+        return;
+      }
+      totalBytes += size;
+      images.set(src, buffer);
+    });
+
+    const qrKeys = [...qrEntries.keys()];
+    const qrBuffers = await mapWithConcurrency(qrKeys, MAX_CONCURRENT_IMAGE_LOADS, async (key) => {
+      const primitive = qrEntries.get(key);
       try {
-        const pageSize = layout.pageSize || 'A4';
-        const orientation = layout.orientation || 'portrait';
-        const margins = layout.margins || { top: 50, right: 50, bottom: 50, left: 50 };
-
-        const doc = new PDFDocument({
-          size: pageSize,
-          layout: orientation,
-          margin: 0, // We'll handle margins manually
-          bufferPages: true
+        return await QRCode.toBuffer(String(primitive.value), {
+          margin: 1,
+          width: Math.max(120, Math.round(primitive.size * 3)),
+          color: {
+            dark: normalizeColor(primitive.foreground, '#000000'),
+            light: normalizeColor(primitive.background, '#ffffff') || '#ffffff'
+          }
         });
-
-        const chunks = [];
-        doc.on('data', chunk => chunks.push(chunk));
-        doc.on('end', () => resolve(Buffer.concat(chunks)));
-        doc.on('error', reject);
-
-        // Register Arabic font if available
-        if (fs.existsSync(this.arabicFontPath)) {
-          doc.registerFont('Arabic', this.arabicFontPath);
-        }
-
-        const isRTL = language === 'ar';
-        const title = template.title[language] || template.title.en;
-
-        // Set initial position with margins
-        doc.x = margins.left;
-        doc.y = margins.top;
-
-        // Header (if enabled)
-        const headerConfig = pdfStyle.header || {};
-        if (headerConfig.enabled !== false) {
-          await this.addHeader(doc, title, isRTL, pdfStyle, language, margins);
-        }
-
-        // General Information
-        this.addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins, options.organization || null);
-        doc.moveDown();
-
-        // Form Sections - Use sectionOrder if available
-        let sectionsToRender = template.sections;
-        if (layout.sectionOrder && layout.sectionOrder.length > 0) {
-          // Sort sections according to sectionOrder
-          const sectionMap = new Map(template.sections.map(s => [s.id, s]));
-          sectionsToRender = layout.sectionOrder
-            .map(id => sectionMap.get(id))
-            .filter(s => s !== undefined);
-
-          // Add any sections not in sectionOrder
-          const orderedIds = new Set(layout.sectionOrder);
-          template.sections.forEach(section => {
-            if (!orderedIds.has(section.id)) {
-              sectionsToRender.push(section);
-            }
-          });
-        }
-
-        // Filter visible sections
-        sectionsToRender = sectionsToRender.filter(section => section.visible !== false);
-
-        for (const section of sectionsToRender) {
-          await this.addSection(doc, section, formInstance.values, language, isRTL, pdfStyle, margins);
-          doc.moveDown();
-        }
-
-        // Status and Approval
-        this.addApprovalSection(doc, formInstance, language, isRTL, pdfStyle, margins);
-
-        // Footer (if enabled)
-        const footerConfig = pdfStyle.footer || {};
-        if (footerConfig.enabled !== false) {
-          await this.addFooter(doc, isRTL, pdfStyle, language, margins);
-        }
-
-        // Watermark — render on all pages after content is drawn
-        if (watermarkBuffer) {
-          this.addWatermark(doc, watermarkBuffer, pdfStyle, margins);
-        }
-
-        doc.end();
       } catch (error) {
-        reject(error);
+        console.warn('[pdfGenerator] QR generation failed:', error.message);
+        return null;
       }
     });
+
+    const qrCodes = new Map();
+    qrKeys.forEach((key, index) => {
+      if (qrBuffers[index]) {
+        qrCodes.set(key, qrBuffers[index]);
+      }
+    });
+
+    return { images, qrCodes };
   }
 
-  async addHeader(doc, title, isRTL, pdfStyle, language, margins) {
-    const headerConfig = pdfStyle.header || {};
-    const branding = pdfStyle.branding || {};
-    const headerHeight = headerConfig.height || 80;
-    const headerBgColor = headerConfig.backgroundColor || '#ffffff';
-    const headerTextColor = headerConfig.textColor || '#000000';
-    const headerFontSize = headerConfig.fontSize || 16;
-    const primaryColor = branding.primaryColor || pdfStyle.colors?.primary || '#d4b900';
-    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'AraRM';
-    const headerLayout = headerConfig.layout || 'default';
-    const showLogo = headerConfig.showLogo !== false && !!branding.logoUrl;
-    const logoSize = clampNumber(headerConfig.logoSize, 64, 0, 160);
+  drawRect(doc, primitive) {
+    const fill = normalizeColor(primitive.fill);
+    const stroke = normalizeColor(primitive.stroke);
+    if (!fill && !stroke) return;
 
-    // Draw header background
-    doc.rect(margins.left, margins.top, doc.page.width - margins.left - margins.right, headerHeight)
-      .fill(headerBgColor);
-
-    let currentY = margins.top + 10;
-
-    // Load logo image if enabled
-    let logoBuffer = null;
-    if (showLogo) {
-      logoBuffer = await resolveAndLoadImage(branding.logoUrl);
+    const radius = clampNumber(primitive.radius, 0, 0, Math.min(primitive.w, primitive.h) / 2);
+    doc.save();
+    // The browser executor applies `transform: rotate()` to rotated rects, so the
+    // PDF has to do the same or a stamp outline is straight in one and tilted in
+    // the other.
+    const rotation = clampNumber(primitive.rotation, 0, -180, 180);
+    if (rotation) {
+      doc.rotate(rotation, { origin: [primitive.x + primitive.w / 2, primitive.y + primitive.h / 2] });
+    }
+    if (radius > 0) {
+      doc.roundedRect(primitive.x, primitive.y, primitive.w, primitive.h, radius);
+    } else {
+      doc.rect(primitive.x, primitive.y, primitive.w, primitive.h);
     }
 
-    if (headerLayout === 'split') {
-      // Split Layout: Logo + Company on left, Form Title on right
-      // ... we'll use a simplified layout for now
+    if (primitive.dash) {
+      doc.dash(primitive.dash[0], { space: primitive.dash[1] });
     }
 
-    // Logo rendering
-    if (logoBuffer) {
-      const logoX = margins.left + 10;
-      const logoY = margins.top + (headerHeight - logoSize) / 2;
-      try {
-        doc.image(logoBuffer, logoX, logoY, {
-          fit: [logoSize, logoSize],
-          align: 'center',
-          valign: 'center'
-        });
-        // Shift text to the right of the logo
-        const textX = logoX + logoSize + 15;
-
-        // Company Name
-        doc.fontSize(headerFontSize + 4)
-          .fillColor(primaryColor)
-          .text(companyName, textX, currentY, {
-            align: 'left',
-            width: doc.page.width - margins.right - textX
-          });
-
-        currentY = doc.y + 5;
-
-        // Form Title (if enabled)
-        if (headerConfig.showTitle !== false) {
-          doc.fontSize(headerFontSize)
-            .fillColor(headerTextColor)
-            .text(title, textX, currentY, {
-              align: 'left',
-              width: doc.page.width - margins.right - textX
-            });
-          currentY = doc.y + 5;
-        }
-
-        // Date (if enabled)
-        if (headerConfig.showDate !== false) {
-          const dateText = isRTL
-            ? `التاريخ: ${new Date().toLocaleDateString('ar-EG')}`
-            : `Date: ${new Date().toLocaleDateString()}`;
-          doc.fontSize(headerFontSize - 4)
-            .fillColor(headerTextColor)
-            .text(dateText, textX, currentY, {
-              align: 'left',
-              width: doc.page.width - margins.right - textX
-            });
-        }
-      } catch (err) {
-        console.warn('[pdfGenerator] Error rendering logo in header:', err.message);
-        // Fallback: render text without logo
-        logoBuffer = null;
-      }
+    if (fill && stroke) {
+      doc.lineWidth(primitive.strokeWidth || 1).fillAndStroke(fill, stroke);
+    } else if (fill) {
+      doc.fill(fill);
+    } else {
+      doc.lineWidth(primitive.strokeWidth || 1).stroke(stroke);
     }
-
-    if (!logoBuffer) {
-      // No logo — render text only
-      // Company Name
-      doc.fontSize(headerFontSize + 4)
-        .fillColor(primaryColor)
-        .text(companyName, margins.left, currentY, {
-          align: headerConfig.logoPosition || 'left',
-          width: doc.page.width - margins.left - margins.right
-        });
-
-      currentY = doc.y + 5;
-
-      // Form Title (if enabled)
-      if (headerConfig.showTitle !== false) {
-        doc.fontSize(headerFontSize)
-          .fillColor(headerTextColor)
-          .text(title, margins.left, currentY, {
-            align: headerConfig.logoPosition || 'left',
-            width: doc.page.width - margins.left - margins.right
-          });
-        currentY = doc.y + 5;
-      }
-
-      // Date (if enabled)
-      if (headerConfig.showDate !== false) {
-        const dateText = isRTL
-          ? `التاريخ: ${new Date().toLocaleDateString('ar-EG')}`
-          : `Date: ${new Date().toLocaleDateString()}`;
-        doc.fontSize(headerFontSize - 4)
-          .fillColor(headerTextColor)
-          .text(dateText, margins.left, currentY, {
-            align: headerConfig.logoPosition || 'left',
-            width: doc.page.width - margins.left - margins.right
-          });
-        currentY = doc.y + 5;
-      }
-    }
-
-    // Draw separator line
-    doc.moveTo(margins.left, margins.top + headerHeight)
-      .lineTo(doc.page.width - margins.right, margins.top + headerHeight)
-      .strokeColor(primaryColor)
-      .lineWidth(2)
-      .stroke();
-
-    // Update doc position
-    doc.y = margins.top + headerHeight + 10;
+    doc.undash();
+    doc.restore();
   }
 
-  addGeneralInfo(doc, formInstance, user, language, isRTL, pdfStyle, margins, organization = null) {
-    const metadataConfig = pdfStyle.metadata || {};
-    if (metadataConfig.enabled === false) {
-      return;
+  drawLine(doc, primitive) {
+    const stroke = normalizeColor(primitive.stroke, '#000000');
+    doc.save();
+    if (primitive.dash) {
+      doc.dash(primitive.dash[0], { space: primitive.dash[1] });
     }
+    doc.moveTo(primitive.x1, primitive.y1)
+      .lineTo(primitive.x2, primitive.y2)
+      .lineWidth(Math.max(0.1, primitive.width || 1))
+      .stroke(stroke);
+    doc.undash();
+    doc.restore();
+  }
 
-    const fontSize = pdfStyle.fontSize?.field || 10;
-    const textColor = pdfStyle.colors?.text || '#000000';
+  drawText(doc, primitive, fonts) {
+    const color = normalizeColor(primitive.color, '#000000');
+    const fontSize = Math.max(1, primitive.fontSize);
+    // Centre the glyphs inside the engine's line box; the browser executor
+    // applies the identical offset so baselines agree between renderers.
+    const baselineOffset = Math.max(0, (primitive.lineHeight - fontSize) / 2);
 
-    doc.fontSize(fontSize + 2).fillColor(textColor);
+    primitive.lines.forEach((line, index) => {
+      if (!line) return;
+      this.selectFont(doc, line, primitive.bold, fonts);
+      doc.fontSize(fontSize).fillColor(color);
 
-    const labels = {
-      en: {
-        formId: 'Form ID',
-        date: 'Date',
-        shift: 'Shift',
-        department: 'Department',
-        filledBy: 'Filled By',
-        submittedOn: 'Submitted On',
-        approvedBy: 'Approved By',
-        approvalDate: 'Approval Date'
-      },
-      ar: {
-        formId: 'رقم النموذج',
-        date: 'التاريخ',
-        shift: 'الوردية',
-        department: 'القسم',
-        filledBy: 'تم الملء بواسطة',
-        submittedOn: 'تاريخ الإرسال',
-        approvedBy: 'تم الاعتماد بواسطة',
-        approvalDate: 'تاريخ الاعتماد'
-      }
-    };
-
-    const lang = labels[language] || labels.en;
-
-    const formatDateValue = (value) => {
-      if (!value) {
-        return '-';
+      const lineWidth = doc.widthOfString(line);
+      let x = primitive.x;
+      if (primitive.align === 'center') {
+        x = primitive.x + Math.max(0, (primitive.w - lineWidth) / 2);
+      } else if (primitive.align === 'right') {
+        x = primitive.x + Math.max(0, primitive.w - lineWidth);
       }
 
-      const locale = language === 'ar' ? 'ar-EG' : 'en-US';
-      return new Date(value).toLocaleDateString(locale, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
-      });
-    };
-
-    const translateShift = (shift) => {
-      if (!shift) {
-        return '-';
-      }
-
-      const shiftLabels = {
-        en: {
-          morning: 'Morning',
-          evening: 'Evening',
-          night: 'Night'
-        },
-        ar: {
-          morning: 'صباحي',
-          evening: 'مسائي',
-          night: 'ليلي'
-        }
-      };
-
-      const localized = shiftLabels[language]?.[shift];
-      return localized || shift;
-    };
-
-    const infoLines = [];
-
-    if (metadataConfig.showFormId !== false) {
-      infoLines.push(`${lang.formId}: #${String(formInstance._id || '').slice(-8) || '-'}`);
-    }
-    if (metadataConfig.showDate !== false) {
-      infoLines.push(`${lang.date}: ${formatDateValue(formInstance.date)}`);
-    }
-    if (metadataConfig.showShift !== false) {
-      infoLines.push(`${lang.shift}: ${translateShift(formInstance.shift)}`);
-    }
-    if (metadataConfig.showDepartment !== false) {
-      infoLines.push(`${lang.department}: ${this.getDepartmentLabel(organization, formInstance.department, language)}`);
-    }
-    if (metadataConfig.showFilledBy !== false) {
-      infoLines.push(`${lang.filledBy}: ${formInstance.filledBy?.name || user?.name || '-'}`);
-    }
-    if (metadataConfig.showSubmittedOn !== false) {
-      infoLines.push(`${lang.submittedOn}: ${formatDateValue(formInstance.createdAt)}`);
-    }
-    if (formInstance.approvedBy && metadataConfig.showApprovedBy !== false) {
-      infoLines.push(`${lang.approvedBy}: ${formInstance.approvedBy?.name || '-'}`);
-    }
-    if (formInstance.approvedBy && metadataConfig.showApprovalDate !== false) {
-      infoLines.push(`${lang.approvalDate}: ${formatDateValue(formInstance.approvalDate)}`);
-    }
-
-    infoLines.forEach(line => {
-      doc.text(line, margins.left, doc.y, {
-        align: isRTL ? 'right' : 'left',
-        width: doc.page.width - margins.left - margins.right
+      doc.text(line, x, primitive.y + index * primitive.lineHeight + baselineOffset, {
+        lineBreak: false,
+        width: Math.max(lineWidth, primitive.w)
       });
     });
   }
 
-  /**
-   * Flatten grouped table columns into leaf columns (replicates frontend getLeafTableColumns).
-   */
-  _getLeafTableColumns(columns = []) {
-    return columns.flatMap((col) => {
-      const children = Array.isArray(col?.children) ? col.children.filter(Boolean) : [];
-      return children.length > 0 ? this._getLeafTableColumns(children) : [col];
-    });
-  }
+  drawImage(doc, primitive, images) {
+    const source = images.get(primitive.src);
+    if (!source) return;
 
-  async addSection(doc, section, values, language, isRTL, pdfStyle, margins) {
-    // Skip if section is not visible
-    if (section.visible === false) return;
+    const opacity = primitive.opacity === undefined ? 1 : clampNumber(primitive.opacity, 1, 0, 1);
+    const rotation = clampNumber(primitive.rotation, 0, -180, 180);
 
-    const sectionStyle = section.pdfStyle || {};
-    const sectionSpacing = pdfStyle.spacing?.sectionSpacing || 20;
-    const fieldSpacing = pdfStyle.spacing?.fieldSpacing || 10;
-    const sectionFontSize = pdfStyle.fontSize?.section || 14;
-    const fieldFontSize = pdfStyle.fontSize?.field || 10;
-    const primaryColor = pdfStyle.colors?.primary || '#d4b900';
-    const textColor = pdfStyle.colors?.text || '#000000';
-    const borderColor = sectionStyle.borderColor || pdfStyle.colors?.border || '#e5e7eb';
-    const backgroundColor = sectionStyle.backgroundColor || '#ffffff';
-    const advancedLayout = section.advancedLayout || {};
-    const layoutType = advancedLayout.layoutType || 'simple';
-
-    // Check if we need a new page
-    if (doc.y > doc.page.height - margins.bottom - 100) {
-      doc.addPage();
-      doc.y = margins.top;
+    doc.save();
+    if (opacity < 1) {
+      doc.opacity(opacity);
+    }
+    if (rotation) {
+      doc.rotate(rotation, { origin: [primitive.x + primitive.w / 2, primitive.y + primitive.h / 2] });
     }
 
-    // Section Header
-    const sectionLabel = section.label[language] || section.label.en;
-    const sectionType = section.sectionType || 'normal';
-
-    // Check if title should be shown
-    const showTitle = advancedLayout.styling?.showTitle !== false;
-
-    // Apply section-specific styling based on sectionType
-    if (sectionType === 'header') {
-      // Header section - larger, centered
-      if (showTitle) {
-        doc.fontSize(sectionFontSize + 4)
-          .fillColor(primaryColor)
-          .text(sectionLabel, margins.left, doc.y, {
-            align: 'center',
-            width: doc.page.width - margins.left - margins.right
-          });
-        doc.y += sectionSpacing;
-      }
-    } else {
-      // Normal section
-      if (showTitle) {
-        // Draw section background if enabled
-        if (sectionStyle.showBackground && backgroundColor !== '#ffffff') {
-          doc.rect(margins.left, doc.y - 5, doc.page.width - margins.left - margins.right, sectionFontSize + 10)
-            .fill(backgroundColor);
-        }
-
-        // Section title
-        doc.fontSize(sectionFontSize)
-          .fillColor(primaryColor)
-          .text(sectionLabel, margins.left, doc.y, {
-            align: isRTL ? 'right' : 'left',
-            width: doc.page.width - margins.left - margins.right
-          });
-
-        // Draw border if enabled
-        if (sectionStyle.showBorder !== false) {
-          const borderWidth = sectionStyle.borderWidth || 1;
-          doc.moveTo(margins.left, doc.y + 5)
-            .lineTo(doc.page.width - margins.right, doc.y + 5)
-            .strokeColor(borderColor)
-            .lineWidth(borderWidth)
-            .stroke();
-        }
-
-        doc.y += sectionSpacing / 2;
+    if (primitive.backgroundColor) {
+      const background = normalizeColor(primitive.backgroundColor);
+      if (background) {
+        doc.rect(primitive.x, primitive.y, primitive.w, primitive.h).fill(background);
       }
     }
 
-    // ── Table Layout ──
-    if (layoutType === 'table' && advancedLayout.table?.enabled && advancedLayout.table?.columns?.length > 0) {
-      this._renderTable(doc, section, values, language, isRTL, pdfStyle, margins);
-      doc.y += sectionSpacing;
-      return;
-    }
-
-    // Section Fields - Filter visible fields and sort by order
-    let fieldsToRender = section.fields.filter(field => field.visible !== false);
-    fieldsToRender.sort((a, b) => (a.order || 0) - (b.order || 0));
-
-    for (const field of fieldsToRender) {
-      const fieldKey = `${section.id}.${field.key}`;
-      const value = values.get ? values.get(fieldKey) : values[fieldKey];
-      const fieldLabel = field.label[language] || field.label.en;
-
-      // Skip if field PDF display is disabled
-      if (field.pdfDisplay?.showValue === false && field.pdfDisplay?.showLabel === false) {
-        continue;
-      }
-
-      // --- Image field handling ---
-      if (field.type === 'image' && field.pdfDisplay?.showValue !== false) {
-        const showLabel = field.pdfDisplay?.showLabel !== false;
-        const fieldLayout = field.layout || {};
-
-        // Extract image URL from value
-        let imageUrl = '';
-        if (value) {
-          if (typeof value === 'string') {
-            imageUrl = value;
-          } else if (typeof value === 'object') {
-            imageUrl = value.url || value.path || '';
-          }
-        }
-
-        // Show label
-        if (showLabel) {
-          doc.fontSize(fieldFontSize)
-            .fillColor(textColor)
-            .font('Helvetica');
-          doc.text(fieldLabel, margins.left, doc.y, {
-            align: isRTL ? 'right' : 'left',
-            width: doc.page.width - margins.left - margins.right
-          });
-          doc.y += 5;
-        }
-
-        // Render image if URL exists
-        if (imageUrl) {
-          const imgBuffer = await resolveAndLoadImage(imageUrl);
-          if (imgBuffer) {
-            const imgWidth = Math.min(
-              Math.max(Number(fieldLayout.imageWidth) || 220, 40),
-              doc.page.width - margins.left - margins.right
-            );
-            const imgHeight = Math.min(
-              Math.max(Number(fieldLayout.imageHeight) || 160, 40),
-              doc.page.height - doc.y - margins.bottom
-            );
-
-            // Check if we need a new page for the image
-            if (doc.y + imgHeight > doc.page.height - margins.bottom) {
-              doc.addPage();
-              doc.y = margins.top;
-            }
-
-            try {
-              doc.image(imgBuffer, margins.left, doc.y, {
-                fit: [imgWidth, imgHeight],
-                align: 'center',
-                valign: 'center'
-              });
-              doc.y += imgHeight + 10;
-            } catch (err) {
-              console.warn(`[pdfGenerator] Error rendering image field ${fieldKey}:`, err.message);
-              doc.fontSize(fieldFontSize)
-                .fillColor(textColor)
-                .font('Helvetica')
-                .text(language === 'ar' ? '(تعذر عرض الصورة)' : '(Could not display image)',
-                  margins.left, doc.y, {
-                    align: isRTL ? 'right' : 'left',
-                    width: doc.page.width - margins.left - margins.right
-                  });
-              doc.y += fieldSpacing;
-            }
-          } else {
-            doc.fontSize(fieldFontSize)
-              .fillColor(textColor)
-              .font('Helvetica')
-              .text(language === 'ar' ? 'لا توجد صورة مرفوعة' : 'No image uploaded',
-                margins.left, doc.y, {
-                  align: isRTL ? 'right' : 'left',
-                  width: doc.page.width - margins.left - margins.right
-                });
-            doc.y += fieldSpacing;
-          }
-        } else {
-          doc.fontSize(fieldFontSize)
-            .fillColor(textColor)
-            .font('Helvetica')
-            .text(language === 'ar' ? 'لا توجد صورة مرفوعة' : 'No image uploaded',
-              margins.left, doc.y, {
-                align: isRTL ? 'right' : 'left',
-                width: doc.page.width - margins.left - margins.right
-              });
-          doc.y += fieldSpacing;
-        }
-
-        continue;
-      }
-
-      // --- Non-image fields (text, date, boolean, etc.) ---
-      let displayValue = value !== undefined && value !== null
-        ? value
-        : (field.defaultValue?.[language] || field.defaultValue?.en || field.defaultValue?.ar || '-');
-
-      // Format boolean values
-      if (field.type === 'boolean') {
-        displayValue = value ? (language === 'ar' ? 'نعم' : 'Yes') : (language === 'ar' ? 'لا' : 'No');
-      }
-
-      // Format date values
-      if (field.type === 'date' && value) {
-        displayValue = new Date(value).toLocaleDateString();
-      }
-
-      // Format time values
-      if (field.type === 'time' && value) {
-        displayValue = String(value);
-      }
-
-      // Format datetime values
-      if (field.type === 'datetime' && value) {
-        displayValue = new Date(value).toLocaleString();
-      }
-
-      // Format number values
-      if (field.type === 'number' && value) {
-        displayValue = typeof value === 'number' ? value.toString() : value;
-      }
-
-      // Field display options
-      const showLabel = field.pdfDisplay?.showLabel !== false;
-      const showValue = field.pdfDisplay?.showValue !== false;
-      const fieldFontSizeVal = field.pdfDisplay?.fontSize || fieldFontSize;
-      const isBold = field.pdfDisplay?.bold || false;
-
-      // Build display text
-      let displayText = '';
-      if (showLabel && showValue) {
-        displayText = `${fieldLabel}: ${displayValue}`;
-      } else if (showLabel) {
-        displayText = fieldLabel;
-      } else if (showValue) {
-        displayText = displayValue;
-      }
-
-      if (field.type === 'static_text' && showValue) {
-        displayText = showLabel ? `${fieldLabel}: ${displayValue}` : displayValue;
-      }
-
-      if (displayText) {
-        doc.fontSize(fieldFontSizeVal)
-          .fillColor(textColor);
-
-        if (isBold) {
-          doc.font('Helvetica-Bold');
-        } else {
-          doc.font('Helvetica');
-        }
-
-        doc.text(displayText, margins.left, doc.y, {
-          align: isRTL ? 'right' : 'left',
-          width: doc.page.width - margins.left - margins.right
-        });
-
-        doc.y += fieldSpacing;
-      }
-    }
-
-    doc.y += sectionSpacing;
-  }
-
-  /**
-   * Render a table layout section.
-   */
-  _renderTable(doc, section, values, language, isRTL, pdfStyle, margins) {
-    const advancedLayout = section.advancedLayout || {};
-    const tableConfig = advancedLayout.table || {};
-    const tableColumns = tableConfig.columns || [];
-    const leafColumns = this._getLeafTableColumns(tableColumns);
-    const hasGroupedHeaders = tableColumns.some((col) => Array.isArray(col?.children) && col.children.length > 0);
-
-    if (leafColumns.length === 0) return;
-
-    const textColor = pdfStyle.colors?.text || '#000000';
-    const borderColor = pdfStyle.colors?.border || '#e5e7eb';
-    const fieldFontSize = pdfStyle.fontSize?.field || 10;
-    const availableWidth = doc.page.width - margins.left - margins.right;
-    const colWidth = availableWidth / leafColumns.length;
-    const tableLeft = margins.left;
-    const rowHeight = 22;
-    const headerBgColor = '#f3f4f6';
-    const cellPadding = 4;
-
-    // -- Build rows from values --
-    const rows = [];
-    if (tableConfig.dynamicRows && tableConfig.rowSource) {
-      const fieldKey = `${section.id}.${tableConfig.rowSource}`;
-      const rowData = values.get ? values.get(fieldKey) : values[fieldKey];
-      if (Array.isArray(rowData)) {
-        rows.push(...rowData);
-      }
-    } else {
-      // Static rows — read cell values keyed as sectionId.row_N.col_colId
-      const numberOfRows = tableConfig.numberOfRows || 10;
-      for (let rowIdx = 0; rowIdx < numberOfRows; rowIdx++) {
-        const row = {};
-        let hasData = false;
-        leafColumns.forEach((col, colIdx) => {
-          const colId = col.id || `col${colIdx + 1}`;
-          const cellKey = `${section.id}.row_${rowIdx}.col_${colId}`;
-          const cellValue = values[cellKey];
-          if (cellValue !== undefined && cellValue !== null && cellValue !== '') {
-            hasData = true;
-          }
-          row[colId] = cellValue !== undefined && cellValue !== null && cellValue !== '' ? cellValue : '';
-        });
-        if (hasData || rowIdx === 0) {
-          rows.push(row);
-        }
-      }
-    }
-
-    // -- Header row --
-    let y = doc.y;
-    const headerRowCount = hasGroupedHeaders ? 2 : 1;
-
-    // Draw header background
-    doc.rect(tableLeft, y, availableWidth, rowHeight * headerRowCount)
-      .fill(headerBgColor);
-
-    if (hasGroupedHeaders) {
-      // Row 1: parent columns — compute x position by accumulating leaf widths
-      let parentX = tableLeft;
-      tableColumns.forEach((col) => {
-        const children = Array.isArray(col?.children) ? col.children.filter(Boolean) : [];
-        const childLeaves = children.length > 0 ? this._getLeafTableColumns(children) : [col];
-        const leafCount = childLeaves.length;
-        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
-        const w = colWidth * leafCount;
-        doc.fontSize(fieldFontSize - 1)
-          .fillColor(col.headerStyle?.textColor || textColor)
-          .font('Helvetica-Bold')
-          .text(colLabel, parentX + cellPadding, y + 2, {
-            width: w - cellPadding * 2,
-            align: 'center'
-          });
-        parentX += w;
-      });
-      y += rowHeight;
-
-      // Row 2: child columns
-      doc.rect(tableLeft, y, availableWidth, rowHeight).fill(headerBgColor);
-      leafColumns.forEach((col, colIdx) => {
-        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
-        const x = tableLeft + colIdx * colWidth;
-        doc.fontSize(fieldFontSize - 1)
-          .fillColor(col.headerStyle?.textColor || textColor)
-          .font('Helvetica-Bold')
-          .text(colLabel, x + cellPadding, y + 2, {
-            width: colWidth - cellPadding * 2,
-            align: isRTL ? 'right' : 'left'
-          });
-      });
-    } else {
-      leafColumns.forEach((col, colIdx) => {
-        const colLabel = col.label?.[language] || col.label?.en || col.label?.ar || '';
-        const x = tableLeft + colIdx * colWidth;
-        doc.fontSize(fieldFontSize - 1)
-          .fillColor(col.headerStyle?.textColor || textColor)
-          .font('Helvetica-Bold')
-          .text(colLabel, x + cellPadding, y + 2, {
-            width: colWidth - cellPadding * 2,
-            align: isRTL ? 'right' : 'left'
-          });
-      });
-    }
-
-    y += rowHeight;
-
-    // Draw header bottom border
-    doc.moveTo(tableLeft, y)
-      .lineTo(tableLeft + availableWidth, y)
-      .strokeColor(borderColor)
-      .lineWidth(1)
-      .stroke();
-
-    // -- Data rows --
-    if (rows.length === 0) {
-      // Empty message
-      doc.fontSize(fieldFontSize)
-        .fillColor('#9ca3af')
-        .font('Helvetica')
-        .text(language === 'ar' ? 'لا توجد بيانات' : 'No data',
-          tableLeft, y + 8, {
-            align: 'center',
-            width: availableWidth
-          });
-      y += rowHeight;
-    } else {
-      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
-        const row = rows[rowIdx];
-
-        // Page break check
-        if (y + rowHeight > doc.page.height - margins.bottom) {
-          doc.addPage();
-          y = margins.top;
-        }
-
-        // Striped background
-        if (tableConfig.stripedRows && rowIdx % 2 === 1) {
-          doc.rect(tableLeft, y, availableWidth, rowHeight).fill('#f9fafb');
-        }
-
-        // Cell values
-        leafColumns.forEach((col, colIdx) => {
-          const colId = col.fieldKey || col.id || `col${colIdx + 1}`;
-          let cellValue = row[colId];
-          if (cellValue === undefined || cellValue === null) cellValue = '-';
-
-          // Simple formatting for date/number types
-          if (col.fieldType === 'date' && cellValue) {
-            try { cellValue = new Date(cellValue).toLocaleDateString(); } catch (e) { /* keep raw */ }
-          }
-          if (col.fieldType === 'boolean') {
-            cellValue = cellValue ? (language === 'ar' ? 'نعم' : 'Yes') : (language === 'ar' ? 'لا' : 'No');
-          }
-
-          const x = tableLeft + colIdx * colWidth;
-          doc.fontSize(fieldFontSize - 1)
-            .fillColor(textColor)
-            .font('Helvetica')
-            .text(String(cellValue), x + cellPadding, y + 3, {
-              width: colWidth - cellPadding * 2,
-              align: isRTL ? 'right' : 'left',
-              lineBreak: false
-            });
-        });
-
-        y += rowHeight;
-
-        // Row separator
-        doc.moveTo(tableLeft, y)
-          .lineTo(tableLeft + availableWidth, y)
-          .strokeColor(borderColor)
-          .lineWidth(0.5)
-          .stroke();
-      }
-    }
-
-    // Move doc.y past the table
-    doc.y = y + 10;
-  }
-
-  addApprovalSection(doc, formInstance, language, isRTL, pdfStyle, margins) {
-    if (formInstance.status !== 'approved' || !formInstance.approvedBy) return;
-
-    doc.y += pdfStyle.spacing?.sectionSpacing || 20;
-
-    const fontSize = pdfStyle.fontSize?.field || 10;
-    const textColor = pdfStyle.colors?.text || '#000000';
-    const primaryColor = pdfStyle.colors?.primary || '#d4b900';
-
-    const labels = {
-      en: {
-        approval: 'Approval Information',
-        approvedBy: 'Approved By',
-        approvalDate: 'Approval Date',
-        notes: 'Notes'
-      },
-      ar: {
-        approval: 'معلومات الموافقة',
-        approvedBy: 'تمت الموافقة بواسطة',
-        approvalDate: 'تاريخ الموافقة',
-        notes: 'ملاحظات'
-      }
-    };
-
-    const lang = labels[language] || labels.en;
-
-    doc.fontSize(fontSize + 1)
-      .fillColor(primaryColor)
-      .text(lang.approval, margins.left, doc.y, {
-        align: isRTL ? 'right' : 'left',
-        width: doc.page.width - margins.left - margins.right
-      });
-
-    doc.y += 5;
-    doc.fontSize(fontSize).fillColor(textColor);
-    doc.text(`${lang.approvedBy}: ${formInstance.approvedBy.name || 'N/A'}`, margins.left, doc.y, {
-      align: isRTL ? 'right' : 'left',
-      width: doc.page.width - margins.left - margins.right
-    });
-
-    if (formInstance.approvalDate) {
-      doc.y += 5;
-      doc.text(`${lang.approvalDate}: ${new Date(formInstance.approvalDate).toLocaleString()}`, margins.left, doc.y, {
-        align: isRTL ? 'right' : 'left',
-        width: doc.page.width - margins.left - margins.right
-      });
-    }
-
-    if (formInstance.approvalNotes) {
-      doc.y += 5;
-      doc.text(`${lang.notes}: ${formInstance.approvalNotes}`, margins.left, doc.y, {
-        align: isRTL ? 'right' : 'left',
-        width: doc.page.width - margins.left - margins.right
-      });
-    }
-  }
-
-  addWatermark(doc, watermarkBuffer, pdfStyle, margins) {
-    const branding = pdfStyle.branding || {};
-    // Watermark properties can be directly on branding (frontend style)
-    // or nested under watermarkConfig/pdfStyle.watermark
-    const watermarkConfig = branding.watermarkConfig || pdfStyle.watermark || branding;
-    const watermarkSize = clampNumber(
-      watermarkConfig.watermarkSize || watermarkConfig.size,
-      55, 0, 100
-    );
-    const watermarkOpacity = clampNumber(
-      watermarkConfig.watermarkOpacity || watermarkConfig.opacity,
-      5, 0, 100
-    ) / 100;
-
-    if (!watermarkBuffer) return;
-
-    const pages = doc.bufferedPageRange();
-
-    for (let i = 0; i < pages.count; i++) {
-      doc.switchToPage(i);
-
-      const pageWidth = doc.page.width - margins.left - margins.right;
-      const pageHeight = doc.page.height - margins.top - margins.bottom;
-      const imgWidth = (pageWidth * watermarkSize) / 100;
-      const imgHeight = pageHeight * 0.9; // Max 90% of page height
-
-      const x = margins.left + (pageWidth - imgWidth) / 2;
-      const y = margins.top + (pageHeight - Math.min(imgHeight, imgWidth)) / 2;
-
-      // Save graphics state
+    // Corner radius: the browser clips with `border-radius` + `overflow:hidden`,
+    // so the PDF clips to the same rounded rectangle rather than drawing square.
+    const radius = clampNumber(primitive.radius, 0, 0, Math.min(primitive.w, primitive.h) / 2);
+    if (radius > 0) {
       doc.save();
+      doc.roundedRect(primitive.x, primitive.y, primitive.w, primitive.h, radius).clip();
+    }
 
-      // Set opacity for watermark effect
-      doc.opacity(watermarkOpacity);
+    try {
+      const options = primitive.fit === 'cover'
+        ? { cover: [primitive.w, primitive.h], align: 'center', valign: 'center' }
+        : (primitive.fit === 'fill'
+          ? { width: primitive.w, height: primitive.h }
+          : { fit: [primitive.w, primitive.h], align: 'center', valign: 'center' });
+      doc.image(source, primitive.x, primitive.y, options);
+    } catch (error) {
+      console.warn('[pdfGenerator] Could not draw image:', error.message);
+    }
 
-      // Rotate slightly for watermark look
-      doc.rotate(10, { origin: [doc.page.width / 2, doc.page.height / 2] });
-
-      try {
-        doc.image(watermarkBuffer, x, y, {
-          fit: [imgWidth, Math.min(imgHeight, imgWidth)],
-          align: 'center',
-          valign: 'center'
-        });
-      } catch (err) {
-        console.warn('[pdfGenerator] Error rendering watermark:', err.message);
-      }
-
-      // Restore graphics state
+    if (radius > 0) {
       doc.restore();
     }
-  }
 
-  async addFooter(doc, isRTL, pdfStyle, language, margins) {
-    const footerConfig = pdfStyle.footer || {};
-    const branding = pdfStyle.branding || {};
-    const showQRCode = footerConfig.showQRCode === true && String(footerConfig.qrCodeValue || '').trim();
-    const qrCodeValue = String(footerConfig.qrCodeValue || '').trim();
-    const footerTemplate = ['classic', 'centered', 'contact', 'minimal'].includes(footerConfig.template)
-      ? footerConfig.template
-      : 'classic';
-    const qrCodePosition = footerTemplate === 'centered'
-      ? 'center'
-      : (footerConfig.qrCodePosition === 'left' ? 'left' : 'right');
-    const qrCodeSize = showQRCode ? clampNumber(footerConfig.qrCodeSize, 40, 32, 96) : 0;
-    const qrCodeBuffer = showQRCode
-      ? await QRCode.toBuffer(qrCodeValue, { margin: 1, width: Math.max(120, qrCodeSize * 3) })
-      : null;
-    const qrCodeGap = qrCodeBuffer ? 14 : 0;
-    const minimumHeight = qrCodeBuffer
-      ? (footerTemplate === 'centered' ? qrCodeSize + 70 : 72)
-      : 50;
-    const footerHeight = Math.max(footerConfig.height || 50, minimumHeight);
-    const footerBgColor = footerConfig.backgroundColor || '#f9fafb';
-    const footerTextColor = footerConfig.textColor || '#6b7280';
-    const footerFontSize = footerConfig.fontSize || 8;
-    const pages = doc.bufferedPageRange();
-    const companyName = branding.companyName?.[language] || branding.companyName?.en || 'AraRM';
-    const footerContent = footerConfig.content?.[language] || footerConfig.content?.en ||
-      `${companyName} Restaurant Management System`;
-    const phoneNumber = footerConfig.phoneNumber || branding.companyPhone || '';
-    const socialLinks = footerConfig.showSocialIcons === true && Array.isArray(footerConfig.socialLinks)
-      ? footerConfig.socialLinks.filter((link) => link?.url)
-      : [];
-    const footerExtras = [
-      footerConfig.showPhoneNumber === true && phoneNumber ? phoneNumber : null,
-      socialLinks.length > 0 ? socialLinks.map((link) => link.url).join(' | ') : null
-    ].filter(Boolean).join(' | ');
-
-    for (let i = 0; i < pages.count; i++) {
-      doc.switchToPage(i);
-
-      // Draw footer background
-      doc.rect(margins.left, doc.page.height - margins.bottom - footerHeight,
-        doc.page.width - margins.left - margins.right, footerHeight)
-        .fill(footerBgColor);
-
-      const footerTop = doc.page.height - margins.bottom - footerHeight;
-      if (footerTemplate === 'centered') {
-        let footerY = footerTop + 8;
-        const contentWidth = doc.page.width - margins.left - margins.right;
-
-        if (qrCodeBuffer) {
-          const qrCodeX = margins.left + (contentWidth - qrCodeSize) / 2;
-          doc.image(qrCodeBuffer, qrCodeX, footerY, {
-            fit: [qrCodeSize, qrCodeSize]
-          });
-          footerY += qrCodeSize + 8;
-        }
-
-        if (footerConfig.showPageNumbers !== false) {
-          const pageText = isRTL
-            ? `\u0635\u0641\u062d\u0629 ${i + 1} \u0645\u0646 ${pages.count}`
-            : `Page ${i + 1} of ${pages.count}`;
-
-          doc.fontSize(footerFontSize)
-            .fillColor(footerTextColor)
-            .text(pageText, margins.left, footerY, {
-              align: 'center',
-              width: contentWidth
-            });
-          footerY += 13;
-        }
-
-        if (footerConfig.showCompanyInfo !== false) {
-          doc.fontSize(footerFontSize)
-            .fillColor(footerTextColor)
-            .text(footerContent, margins.left, footerY, {
-              align: 'center',
-              width: contentWidth
-            });
-          footerY += 11;
-        }
-
-        if (footerExtras) {
-          doc.fontSize(Math.max(footerFontSize - 1, 7))
-            .fillColor(footerTextColor)
-            .text(footerExtras, margins.left, footerY, {
-              align: 'center',
-              width: contentWidth
-            });
-        }
-
-        continue;
-      }
-
-      const qrCodeX = qrCodeBuffer
-        ? (qrCodePosition === 'left'
-          ? margins.left + 10
-          : doc.page.width - margins.right - qrCodeSize - 10)
-        : null;
-      const qrCodeY = qrCodeBuffer ? footerTop + (footerHeight - qrCodeSize) / 2 : null;
-      const textX = qrCodeBuffer && qrCodePosition === 'left'
-        ? margins.left + qrCodeSize + qrCodeGap
-        : margins.left;
-      const textWidth = qrCodeBuffer
-        ? doc.page.width - margins.right - textX - (qrCodePosition === 'right' ? qrCodeSize + qrCodeGap : 0)
-        : doc.page.width - margins.left - margins.right;
-      let footerY = footerTop + 8;
-
-      if (qrCodeBuffer) {
-        doc.image(qrCodeBuffer, qrCodeX, qrCodeY, {
-          fit: [qrCodeSize, qrCodeSize]
-        });
-      }
-
-      // Page numbers (if enabled)
-      if (footerConfig.showPageNumbers !== false) {
-        const pageText = isRTL
-          ? `\u0635\u0641\u062d\u0629 ${i + 1} \u0645\u0646 ${pages.count}`
-          : `Page ${i + 1} of ${pages.count}`;
-
-        doc.fontSize(footerFontSize)
-          .fillColor(footerTextColor)
-          .text(pageText, textX, footerY, {
-            align: 'center',
-            width: textWidth
-          });
-        footerY += 13;
-      }
-
-      // Company info (if enabled)
-      if (footerConfig.showCompanyInfo !== false) {
-        doc.fontSize(footerFontSize)
-          .fillColor(footerTextColor)
-          .text(footerContent, textX, footerY, {
-            align: 'center',
-            width: textWidth
-          });
-        footerY += 11;
-      }
-
-      if (footerExtras) {
-        doc.fontSize(Math.max(footerFontSize - 1, 7))
-          .fillColor(footerTextColor)
-          .text(footerExtras, textX, footerY, {
-            align: 'center',
-            width: textWidth
-          });
+    if (primitive.borderWidth > 0) {
+      const borderColor = normalizeColor(primitive.borderColor, '#d1d5db');
+      doc.lineWidth(primitive.borderWidth);
+      if (radius > 0) {
+        doc.roundedRect(primitive.x, primitive.y, primitive.w, primitive.h, radius).stroke(borderColor);
+      } else {
+        doc.rect(primitive.x, primitive.y, primitive.w, primitive.h).stroke(borderColor);
       }
     }
+
+    doc.restore();
+  }
+
+  drawQr(doc, primitive, qrCodes) {
+    const key = `${primitive.value}|${primitive.foreground}|${primitive.background}|${Math.round(primitive.size)}`;
+    const buffer = qrCodes.get(key);
+    if (!buffer) return;
+    try {
+      doc.image(buffer, primitive.x, primitive.y, { fit: [primitive.size, primitive.size] });
+    } catch (error) {
+      console.warn('[pdfGenerator] Could not draw QR code:', error.message);
+    }
+  }
+
+  /**
+   * Build a PDF for a submitted form.
+   *
+   * @returns {Promise<Buffer>}
+   */
+  async generateFormPDF(formInstance, template, user, language = 'en', options = {}) {
+    const plainTemplate = template && typeof template.toObject === 'function'
+      ? template.toObject()
+      : template;
+
+    if (!plainTemplate) {
+      throw new Error('Cannot export a form whose template no longer exists');
+    }
+
+    const organization = options.organization || null;
+    const normalizedLanguage = language === 'ar' ? 'ar' : 'en';
+
+    const styledTemplate = {
+      ...plainTemplate,
+      pdfStyle: this.buildPdfStyle(plainTemplate, organization)
+    };
+
+    const contract = resolveTemplateContract(styledTemplate, { organization });
+    if (!contract.ok) {
+      const error = new Error(contract.error?.message || 'Unsupported template layout version');
+      error.statusCode = 422;
+      throw error;
+    }
+
+    const instance = formInstance && typeof formInstance.toObject === 'function'
+      ? formInstance.toObject()
+      : (formInstance || {});
+
+    const result = layoutDocument({
+      contract,
+      values: instance.values || {},
+      formInstance: instance,
+      language: normalizedLanguage,
+      mode: 'print',
+      resolveDepartment: (code) => this.getDepartmentLabel(organization, code, normalizedLanguage)
+    });
+
+    if (!result.ok) {
+      const error = new Error(result.error?.message || 'Could not lay out the document');
+      error.statusCode = 422;
+      throw error;
+    }
+
+    const assets = await this.preloadAssets(result.pages);
+    const geometry = result.geometry;
+
+    const doc = new PDFDocument({
+      size: [geometry.widthPt, geometry.heightPt],
+      margin: 0,
+      autoFirstPage: false,
+      info: {
+        Title: contract.template.title?.[normalizedLanguage] || contract.template.title?.en || 'Form',
+        Producer: 'AraRM Template Builder'
+      }
+    });
+
+    const fonts = this.registerFonts(doc);
+
+    const chunks = [];
+    const finished = new Promise((resolve, reject) => {
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+    });
+
+    result.pages.forEach((page) => {
+      doc.addPage({ size: [geometry.widthPt, geometry.heightPt], margin: 0 });
+      page.primitives.forEach((primitive) => {
+        switch (primitive.k) {
+          case 'rect':
+            this.drawRect(doc, primitive);
+            break;
+          case 'line':
+            this.drawLine(doc, primitive);
+            break;
+          case 'text':
+            this.drawText(doc, primitive, fonts);
+            break;
+          case 'image':
+            this.drawImage(doc, primitive, assets.images);
+            break;
+          case 'qr':
+            this.drawQr(doc, primitive, assets.qrCodes);
+            break;
+          case 'placeholder':
+            // Editor-only affordance; never printed.
+            break;
+          default:
+            break;
+        }
+      });
+    });
+
+    doc.end();
+    return finished;
+  }
+
+  /** Layout result without rendering — used by tests and parity checks. */
+  layoutForInstance(formInstance, template, language = 'en', options = {}) {
+    const plainTemplate = template && typeof template.toObject === 'function' ? template.toObject() : template;
+    const organization = options.organization || null;
+    const contract = resolveTemplateContract(
+      { ...plainTemplate, pdfStyle: this.buildPdfStyle(plainTemplate || {}, organization) },
+      { organization }
+    );
+    const instance = formInstance && typeof formInstance.toObject === 'function'
+      ? formInstance.toObject()
+      : (formInstance || {});
+
+    return layoutDocument({
+      contract,
+      values: instance.values || {},
+      formInstance: instance,
+      language: language === 'ar' ? 'ar' : 'en',
+      mode: 'print',
+      resolveDepartment: (code) => this.getDepartmentLabel(organization, code, language)
+    });
   }
 }
 
-module.exports = new PDFGenerator();
+const generator = new PDFGenerator();
+generator.PDFGenerator = PDFGenerator;
+generator.resolveAndLoadImage = resolveAndLoadImage;
+generator.downloadImage = downloadImage;
+generator.normalizeColor = normalizeColor;
+generator.isFetchableUrl = isFetchableUrl;
 
+module.exports = generator;
