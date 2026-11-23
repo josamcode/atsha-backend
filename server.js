@@ -13,6 +13,9 @@ dotenv.config();
 
 const app = express();
 
+// Fly terminates requests at one proxy; without this every client shares one rate-limit key.
+app.set('trust proxy', 1);
+
 // Body parser
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
@@ -114,6 +117,7 @@ app.use('/api/', limiter);
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  skipSuccessfulRequests: true,
   message: {
     error: 'Too many login attempts',
     message: 'Too many login attempts, please try again later'
@@ -132,6 +136,29 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+
+const accountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const retryAfter = Math.ceil((req.rateLimit.resetTime - Date.now()) / 1000);
+    res.status(429).json({
+      success: false,
+      error: 'Too many requests',
+      message: 'Too many attempts, please try again later.',
+      retryAfter: retryAfter > 0 ? retryAfter : 0
+    });
+  }
+});
+[
+  '/api/auth/register-organization',
+  '/api/auth/forgot-password',
+  '/api/auth/reset-password',
+  '/api/auth/request-password-reset',
+  '/api/invitations/accept'
+].forEach((route) => app.use(route, accountLimiter));
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));

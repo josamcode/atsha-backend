@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const OrganizationRegistrationVerification = require('../models/OrganizationRegistrationVerification');
@@ -7,6 +8,7 @@ const {
   generateAccessToken,
   generateRefreshToken,
   verifyRefreshToken,
+  verifyAccessToken,
   generateResetToken
 } = require('../utils/tokenUtils');
 const {
@@ -25,10 +27,16 @@ const {
 const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
 const { assertUserSeatAvailable } = require('../utils/subscription');
 const { DEFAULT_PLATFORM_PROFILE } = require('../utils/platformDefaults');
+const {
+  getOrganizationStatusErrorCode,
+  getSessionBlockCode,
+  sendAuthError
+} = require('../utils/authErrors');
 
 const ORGANIZATION_EMAIL_VERIFICATION_EXPIRY_MINUTES = 10;
 const ORGANIZATION_EMAIL_VERIFICATION_CODE_LENGTH = 6;
 const ORGANIZATION_REGISTRATION_SLUG_RETRY_LIMIT = 3;
+const ORGANIZATION_EMAIL_VERIFICATION_MAX_ATTEMPTS = 5;
 
 const normalizeEmail = (value = '') => String(value || '').trim().toLowerCase();
 const hashTokenValue = (value = '') => crypto.createHash('sha256').update(String(value || '')).digest('hex');
@@ -62,10 +70,6 @@ const buildOrganizationScopedEmailQuery = (email, organizationId) => {
     ]
   };
 };
-
-const buildOrganizationScopedLoginQuery = (email, organizationId) => (
-  buildOrganizationScopedEmailQuery(email, organizationId)
-);
 
 const titleizeDepartment = (value = 'other') => value
   .split(/[-_]/)
@@ -127,6 +131,12 @@ const resolveOrganizationForUser = async (user) => {
 
   if (user.organizationId) {
     return Organization.findById(resolveOrganizationId(user.organizationId)).lean();
+  }
+
+  // Legacy accounts never pick their organization from client input.
+  const defaultSlug = String(process.env.DEFAULT_ORGANIZATION_SLUG || '').trim().toLowerCase();
+  if (defaultSlug) {
+    return Organization.findOne({ slug: defaultSlug }).lean();
   }
 
   return findSingleActiveOrganization();
@@ -257,59 +267,127 @@ const getOrganizationRegistrationErrorMessage = (error) => {
   return error.message;
 };
 
-const findLoginUserWithoutOrganization = async (email, password) => {
-  const users = await User.find({
-    email: normalizeEmail(email)
-  })
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+
+const getOrganizationDisplayName = (organization) => (
+  organization?.branding?.displayName || organization?.name || null
+);
+
+const getLoginBlockCode = ({ user, organization }) => {
+  if (!organization) {
+    return user.organizationId ? 'ORGANIZATION_NOT_FOUND' : 'ORGANIZATION_UNRESOLVED';
+  }
+
+  return getOrganizationStatusErrorCode(organization) || (user.isActive ? null : 'ACCOUNT_DEACTIVATED');
+};
+
+const findLoginMatches = async (email, password) => {
+  const users = await User.find({ email: normalizeEmail(email) })
     .select('+password')
     .limit(20);
 
   if (users.length === 0) {
-    return { user: null, organization: null, error: 'not_found' };
-  }
-
-  const matchedUsers = [];
-  for (const candidateUser of users) {
-    const isMatch = await candidateUser.comparePassword(password);
-    if (isMatch) {
-      matchedUsers.push(candidateUser);
-    }
-  }
-
-  if (matchedUsers.length === 0) {
-    return { user: null, organization: null, error: 'not_found' };
-  }
-
-  if (matchedUsers.length > 1) {
-    return { user: null, organization: null, error: 'ambiguous' };
-  }
-
-  const user = matchedUsers[0];
-  const organization = await resolveOrganizationForUser(user);
-  if (!organization) {
-    return { user: null, organization: null, error: 'organization_required' };
-  }
-
-  return { user, organization, error: null };
-};
-
-const resolvePasswordResetTargets = async (email, scopedOrganization = null) => {
-  const normalizedEmail = normalizeEmail(email);
-  const users = await User.find(
-    scopedOrganization
-      ? buildOrganizationScopedEmailQuery(normalizedEmail, scopedOrganization._id)
-      : { email: normalizedEmail }
-  ).select('+resetPasswordToken +resetPasswordExpire');
-
-  if (users.length === 0) {
+    // Keeps response time the same for unknown emails.
+    await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
     return [];
   }
 
-  if (scopedOrganization) {
-    return users.map((user) => ({
-      user,
-      organization: scopedOrganization
-    }));
+  const matches = [];
+  for (const user of users) {
+    if (await user.comparePassword(password)) {
+      matches.push({ user, organization: await resolveOrganizationForUser(user) });
+    }
+  }
+
+  return matches;
+};
+
+// Organization state is only revealed after the password has been verified.
+const selectLoginMatch = (matches, req) => {
+  const resolution = req.organizationResolution;
+  const isSlugScoped = resolution?.source === 'slug';
+
+  if (isSlugScoped && resolution.error) {
+    return { errorCode: 'ORGANIZATION_NOT_FOUND' };
+  }
+
+  const scopedMatches = isSlugScoped
+    ? matches.filter(({ organization }) => organizationIdsMatch(organization, req.organization))
+    : matches;
+
+  if (scopedMatches.length === 0) {
+    return { errorCode: 'ACCOUNT_NOT_IN_ORGANIZATION' };
+  }
+
+  const usableMatches = scopedMatches.filter((match) => !getLoginBlockCode(match));
+
+  if (usableMatches.length === 1) {
+    return { match: usableMatches[0] };
+  }
+
+  if (usableMatches.length > 1) {
+    const domainMatch = resolution?.source === 'domain'
+      ? usableMatches.find(({ organization }) => organizationIdsMatch(organization, req.organization))
+      : null;
+
+    if (domainMatch) {
+      return { match: domainMatch };
+    }
+
+    return {
+      errorCode: 'ORGANIZATION_SELECTION_REQUIRED',
+      extra: {
+        organizations: usableMatches.map(({ organization }) => ({
+          slug: organization.slug,
+          name: getOrganizationDisplayName(organization)
+        }))
+      }
+    };
+  }
+
+  const [blockedMatch] = scopedMatches;
+  return {
+    errorCode: getLoginBlockCode(blockedMatch),
+    extra: { organizationName: getOrganizationDisplayName(blockedMatch.organization) }
+  };
+};
+
+const sendServerError = (res, error) => {
+  if (error?.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      message: Object.values(error.errors).map((entry) => entry.message).join(', ')
+    });
+  }
+
+  if (error?.code === 11000) {
+    return res.status(400).json({
+      success: false,
+      message: 'Duplicate field value entered'
+    });
+  }
+
+  if (error?.statusCode) {
+    return res.status(error.statusCode).json({
+      success: false,
+      code: error.code,
+      message: error.message
+    });
+  }
+
+  console.error('Auth error:', error);
+  return res.status(500).json({
+    success: false,
+    message: 'Server Error'
+  });
+};
+
+const resolvePasswordResetTargets = async (email) => {
+  const users = await User.find({ email: normalizeEmail(email) })
+    .select('+resetPasswordToken +resetPasswordExpire');
+
+  if (users.length === 0) {
+    return [];
   }
 
   const organizationIds = [...new Set(
@@ -406,38 +484,17 @@ const formatUser = (user) => ({
 
 const getActiveOrganization = (req, res) => {
   if (!req.organization) {
-    res.status(400).json({
-      success: false,
-      message: 'Organization context is required'
-    });
+    sendAuthError(res, 'ORGANIZATION_CONTEXT_REQUIRED');
     return null;
   }
 
-  if (req.organization.status !== 'active') {
-    res.status(403).json({
-      success: false,
-      message: 'Organization is not active'
-    });
+  const statusCode = getOrganizationStatusErrorCode(req.organization);
+  if (statusCode) {
+    sendAuthError(res, statusCode);
     return null;
   }
 
   return req.organization;
-};
-
-const ensureUserBelongsToOrganization = (user, organization, res) => {
-  if (!user?.organizationId) {
-    return true;
-  }
-
-  if (!organizationIdsMatch(user.organizationId, organization)) {
-    res.status(401).json({
-      success: false,
-      message: 'User does not belong to the active organization'
-    });
-    return false;
-  }
-
-  return true;
 };
 
 const buildAuthResponse = async (user, organization, tokens = {}) => ({
@@ -472,10 +529,11 @@ const attachLegacyUserToOrganization = async (user, organization) => {
 // @route   GET /api/auth/organization
 // @access  Public
 exports.getOrganizationContext = async (req, res) => {
-  const organization = getActiveOrganization(req, res);
-  if (!organization) {
-    return;
-  }
+  try {
+    const organization = getActiveOrganization(req, res);
+    if (!organization) {
+      return;
+    }
 
     res.json({
       success: true,
@@ -483,11 +541,14 @@ exports.getOrganizationContext = async (req, res) => {
         organization: await formatOrganization(organization)
       }
     });
+  } catch (error) {
+    sendServerError(res, error);
+  }
 };
 
 // @desc    Register user
 // @route   POST /api/auth/register
-// @access  Public (Admin only in production)
+// @access  Private (Organization Admin, Platform Admin)
 exports.register = async (req, res) => {
   try {
     const organization = getActiveOrganization(req, res);
@@ -505,6 +566,14 @@ exports.register = async (req, res) => {
       departments,
       languagePreference
     } = req.body;
+
+    const requestedRole = normalizeRole(role || 'employee');
+    if (requestedRole === 'platform_admin' && normalizeRole(req.user.role) !== 'platform_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only platform admins can assign the platform admin role'
+      });
+    }
 
     const existingUser = await User.findOne(
       buildOrganizationScopedEmailQuery(email, organization._id)
@@ -525,31 +594,18 @@ exports.register = async (req, res) => {
       email,
       password,
       phone,
-      role: role || 'employee',
+      role: toLegacyRole(requestedRole),
       department: department || 'other',
       departments: departments || [],
       languagePreference: languagePreference || 'en'
     });
 
-    const accessToken = generateAccessToken(user, organization);
-    const refreshToken = generateRefreshToken(user, organization);
-
-    await User.updateOne(
-      { _id: user._id },
-      { $set: { refreshToken } }
-    );
-
-    user.refreshToken = refreshToken;
-
-    res.status(201).json(await buildAuthResponse(user, organization, {
-      accessToken,
-      refreshToken
-    }));
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
+    res.status(201).json({
+      success: true,
+      data: { user: formatUser(user) }
     });
+  } catch (error) {
+    sendServerError(res, error);
   }
 };
 
@@ -591,6 +647,7 @@ exports.sendOrganizationRegistrationVerificationCode = async (req, res) => {
           expiresAt: buildOrganizationVerificationExpiryDate(),
           verifiedAt: null,
           consumedAt: null,
+          failedAttempts: 0,
           languagePreference: preferredLanguage,
           lastSentAt: new Date()
         },
@@ -628,10 +685,7 @@ exports.sendOrganizationRegistrationVerificationCode = async (req, res) => {
       message: 'Verification code sent to your email'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -660,7 +714,19 @@ exports.verifyOrganizationRegistrationEmail = async (req, res) => {
       });
     }
 
+    if ((verification.failedAttempts || 0) >= ORGANIZATION_EMAIL_VERIFICATION_MAX_ATTEMPTS) {
+      return res.status(400).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please request a new code.'
+      });
+    }
+
     if (verification.codeHash !== hashTokenValue(code)) {
+      await OrganizationRegistrationVerification.updateOne(
+        { _id: verification._id },
+        { $inc: { failedAttempts: 1 } }
+      );
+
       return res.status(400).json({
         success: false,
         message: 'Invalid or expired verification code'
@@ -680,10 +746,7 @@ exports.verifyOrganizationRegistrationEmail = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -821,78 +884,26 @@ exports.registerOrganization = async (req, res) => {
 // @access  Public
 exports.login = async (req, res) => {
   try {
-    let organization = req.organization || null;
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       return res.status(400).json({
         success: false,
         message: 'Please provide email and password'
       });
     }
 
-    let user = null;
-
-    if (organization) {
-      organization = getActiveOrganization(req, res);
-      if (!organization) {
-        return;
-      }
-
-      user = await User.findOne(
-        buildOrganizationScopedLoginQuery(email, organization._id)
-      ).select('+password');
-
-      if (user) {
-        const isMatch = await user.comparePassword(password);
-        if (!isMatch) {
-          user = null;
-        }
-      }
-    } else {
-      const loginLookup = await findLoginUserWithoutOrganization(email, password);
-      if (loginLookup.error === 'ambiguous') {
-        return res.status(409).json({
-          success: false,
-          message: 'Multiple organizations matched this account. Please provide an organization slug.'
-        });
-      }
-
-      if (loginLookup.error === 'organization_required') {
-        return res.status(400).json({
-          success: false,
-          message: 'Unable to resolve organization for this account'
-        });
-      }
-
-      user = loginLookup.user;
-      organization = loginLookup.organization;
+    const matches = await findLoginMatches(email, password);
+    if (matches.length === 0) {
+      return sendAuthError(res, 'INVALID_CREDENTIALS');
     }
 
-    if (organization?.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
-      });
+    const { match, errorCode, extra } = selectLoginMatch(matches, req);
+    if (errorCode) {
+      return sendAuthError(res, errorCode, extra);
     }
 
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
-    }
-
-    if (!ensureUserBelongsToOrganization(user, organization, res)) {
-      return;
-    }
-
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'Your account has been deactivated'
-      });
-    }
+    const { user, organization } = match;
 
     await attachLegacyUserToOrganization(user, organization);
 
@@ -911,10 +922,7 @@ exports.login = async (req, res) => {
       refreshToken
     }));
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -926,128 +934,74 @@ exports.refreshToken = async (req, res) => {
     const { refreshToken } = req.body;
 
     if (!refreshToken) {
-      return res.status(401).json({
-        success: false,
-        message: 'Refresh token is required'
-      });
+      return sendAuthError(res, 'REFRESH_TOKEN_INVALID');
     }
 
     const decoded = verifyRefreshToken(refreshToken);
-    if (!decoded) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid refresh token'
-      });
+    if (!decoded?.organizationId) {
+      return sendAuthError(res, 'REFRESH_TOKEN_INVALID');
     }
 
-    let organization = req.organization;
-    if (decoded.organizationId) {
-      const tokenOrganization = await Organization.findById(decoded.organizationId).lean();
-
-      if (!tokenOrganization) {
-        return res.status(401).json({
-          success: false,
-          message: 'Organization not found for this session'
-        });
-      }
-
-      if (organization && !organizationIdsMatch(organization, tokenOrganization)) {
-        return res.status(401).json({
-          success: false,
-          message: 'Refresh token organization does not match the active organization'
-        });
-      }
-
-      organization = tokenOrganization;
-    }
-
+    const organization = await Organization.findById(decoded.organizationId).lean();
     if (!organization) {
-      return res.status(400).json({
-        success: false,
-        message: 'Organization context is required'
-      });
-    }
-
-    if (organization.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
-      });
+      return sendAuthError(res, 'SESSION_ORGANIZATION_NOT_FOUND');
     }
 
     const user = await User.findOne(
       buildScopedUserQuery(decoded.id, organization._id)
-    ).select('+refreshToken');
+    ).select('+refreshToken +passwordChangedAt');
 
     if (!user || user.refreshToken !== refreshToken) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid refresh token'
-      });
+      return sendAuthError(res, 'REFRESH_TOKEN_INVALID');
     }
 
-    if (!ensureUserBelongsToOrganization(user, organization, res)) {
-      return;
-    }
-
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'Your account has been deactivated'
-      });
-    }
-
-    if (decoded.role && normalizeRole(decoded.role) !== normalizeRole(user.role)) {
-      return res.status(401).json({
-        success: false,
-        message: 'User role changed. Please sign in again.'
-      });
-    }
-
-    const currentSessionVersion = organization.securitySettings?.sessionVersion || 1;
-    if (decoded.sessionVersion && decoded.sessionVersion !== currentSessionVersion) {
-      return res.status(401).json({
-        success: false,
-        message: 'Session is no longer valid. Please sign in again.'
-      });
+    const blockCode = getSessionBlockCode({ decoded, user, organization });
+    if (blockCode) {
+      return sendAuthError(res, blockCode);
     }
 
     const accessToken = generateAccessToken(user, organization);
 
     res.json({
-        success: true,
-        data: {
-          accessToken,
-          organization: await formatOrganization(organization)
-        }
-      });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
+      success: true,
+      data: {
+        accessToken,
+        organization: await formatOrganization(organization)
+      }
     });
+  } catch (error) {
+    sendServerError(res, error);
   }
 };
 
 // @desc    Logout user
 // @route   POST /api/auth/logout
-// @access  Private
+// @access  Public (identified by refresh or bearer token, so expired sessions can still log out)
 exports.logout = async (req, res) => {
   try {
-    await User.updateOne(
-      buildScopedUserQuery(req.user.id, req.organization?._id),
-      { $set: { refreshToken: null } }
-    );
+    const submittedRefreshToken = req.body?.refreshToken;
+    const decodedRefresh = verifyRefreshToken(submittedRefreshToken);
+
+    if (decodedRefresh) {
+      await User.updateOne(
+        { _id: decodedRefresh.id, refreshToken: submittedRefreshToken },
+        { $set: { refreshToken: null } }
+      );
+    } else {
+      const bearerToken = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+      const decodedAccess = bearerToken ? verifyAccessToken(bearerToken) : null;
+
+      if (decodedAccess) {
+        await User.updateOne({ _id: decodedAccess.id }, { $set: { refreshToken: null } });
+      }
+    }
 
     res.json({
       success: true,
       message: 'Logged out successfully'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1062,10 +1016,7 @@ exports.getMe = async (req, res) => {
 
     res.json(await buildAuthResponse(user || req.user, req.organization));
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1095,10 +1046,7 @@ exports.updateProfile = async (req, res) => {
 
     res.json(await buildAuthResponse(user, req.organization));
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1109,10 +1057,17 @@ exports.changePassword = async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
 
-    if (!currentPassword || !newPassword) {
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
       return res.status(400).json({
         success: false,
         message: 'Please provide current and new password'
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters'
       });
     }
 
@@ -1129,10 +1084,7 @@ exports.changePassword = async (req, res) => {
 
     const isMatch = await user.comparePassword(currentPassword);
     if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        message: 'Current password is incorrect'
-      });
+      return sendAuthError(res, 'CURRENT_PASSWORD_INCORRECT');
     }
 
     user.password = newPassword;
@@ -1140,15 +1092,18 @@ exports.changePassword = async (req, res) => {
     user.resetPasswordExpire = undefined;
     await user.save();
 
+    // Other devices are signed out; this one continues with fresh tokens.
+    const accessToken = generateAccessToken(user, req.organization);
+    const refreshToken = generateRefreshToken(user, req.organization);
+    await User.updateOne({ _id: user._id }, { $set: { refreshToken } });
+
     res.json({
       success: true,
-      message: 'Password changed successfully'
+      message: 'Password changed successfully',
+      data: { accessToken, refreshToken }
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1159,22 +1114,14 @@ exports.forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
 
-    if (!email) {
+    if (typeof email !== 'string' || !email.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Please provide your email address'
       });
     }
 
-    let scopedOrganization = req.organization || null;
-    if (scopedOrganization) {
-      scopedOrganization = getActiveOrganization(req, res);
-      if (!scopedOrganization) {
-        return;
-      }
-    }
-
-    const targets = await resolvePasswordResetTargets(email, scopedOrganization);
+    const targets = getActivePasswordResetTargets(await resolvePasswordResetTargets(email));
     const selfServiceTargets = getSelfServicePasswordResetTargets(targets);
 
     if (targets.length === 0) {
@@ -1216,11 +1163,7 @@ exports.forgotPassword = async (req, res) => {
       message: 'If an account with that email exists, a password reset link has been sent'
     });
   } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1232,7 +1175,7 @@ exports.resetPassword = async (req, res) => {
     const { token } = req.params;
     const { password } = req.body;
 
-    if (!password) {
+    if (typeof password !== 'string' || !password) {
       return res.status(400).json({
         success: false,
         message: 'Please provide a new password'
@@ -1251,7 +1194,7 @@ exports.resetPassword = async (req, res) => {
     const user = await User.findOne({
       resetPasswordToken: hashedToken,
       resetPasswordExpire: { $gt: Date.now() }
-    }).select('+resetPasswordToken +resetPasswordExpire');
+    }).select('+resetPasswordToken +resetPasswordExpire +refreshToken');
 
     if (!user) {
       return res.status(400).json({
@@ -1260,28 +1203,20 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
-    let organization = req.organization;
-    if (!organization && user.organizationId) {
-      organization = await Organization.findById(user.organizationId).lean();
-    }
-
-    if (organization && user.organizationId && !organizationIdsMatch(user.organizationId, organization)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Reset token does not belong to the active organization'
-      });
-    }
-
-    if (organization && organization.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
+    const organization = await resolveOrganizationForUser(user);
+    const blockCode = getLoginBlockCode({ user, organization });
+    if (blockCode) {
+      return sendAuthError(res, blockCode, {
+        organizationName: getOrganizationDisplayName(organization)
       });
     }
 
     user.password = password;
+    user.refreshToken = undefined;
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
+    user.passwordResetRequested = false;
+    user.passwordResetRequestDate = undefined;
     await user.save();
 
     res.json({
@@ -1289,10 +1224,7 @@ exports.resetPassword = async (req, res) => {
       message: 'Password reset successfully'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };
 
@@ -1303,24 +1235,14 @@ exports.requestPasswordReset = async (req, res) => {
   try {
     const { email } = req.body;
 
-    if (!email) {
+    if (typeof email !== 'string' || !email.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Please provide your email address'
       });
     }
 
-    let scopedOrganization = req.organization || null;
-    if (scopedOrganization) {
-      scopedOrganization = getActiveOrganization(req, res);
-      if (!scopedOrganization) {
-        return;
-      }
-    }
-
-    const targets = getActivePasswordResetTargets(
-      await resolvePasswordResetTargets(email, scopedOrganization)
-    );
+    const targets = getActivePasswordResetTargets(await resolvePasswordResetTargets(email));
 
     if (targets.length === 0) {
       return res.json({
@@ -1353,10 +1275,6 @@ exports.requestPasswordReset = async (req, res) => {
       message: 'If an account with that email exists, a password reset request has been sent to administrators'
     });
   } catch (error) {
-    console.error('Request password reset error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    sendServerError(res, error);
   }
 };

@@ -29,6 +29,10 @@ const organizationRegistrationVerificationSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+  failedAttempts: {
+    type: Number,
+    default: 0
+  },
   languagePreference: {
     type: String,
     enum: ['ar', 'en'],

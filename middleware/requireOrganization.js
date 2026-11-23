@@ -1,19 +1,16 @@
+const { sendAuthError } = require('../utils/authErrors');
+
 const requireOrganization = (req, res, next) => {
   if (req.organization) {
     return next();
   }
 
-  if (req.organizationResolution?.error === 'not_found') {
-    return res.status(404).json({
-      success: false,
-      message: 'Organization not found'
-    });
-  }
-
-  return res.status(400).json({
-    success: false,
-    message: 'Organization context is required'
-  });
+  return sendAuthError(
+    res,
+    req.organizationResolution?.error === 'not_found'
+      ? 'ORGANIZATION_NOT_FOUND'
+      : 'ORGANIZATION_CONTEXT_REQUIRED'
+  );
 };
 
 module.exports = requireOrganization;

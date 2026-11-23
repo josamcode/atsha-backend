@@ -65,28 +65,29 @@ const resolveOrganizationContext = async (req) => {
   let organization = null;
   let resolution = null;
 
-  const hostCandidates = getHostCandidates(req);
-  for (const host of hostCandidates) {
-    organization = await Organization.findOne({ allowedDomains: host }).lean();
+  const slugCandidates = getSlugCandidates(req);
+  for (const slug of slugCandidates) {
+    organization = await Organization.findOne({ slug }).lean();
     if (organization) {
-      resolution = { source: 'domain', value: host };
+      resolution = { source: 'slug', value: slug };
       break;
     }
   }
 
-  if (!organization) {
-    const slugCandidates = getSlugCandidates(req);
+  if (!organization && slugCandidates.length > 0) {
+    req.organization = null;
+    req.organizationResolution = { source: 'slug', value: slugCandidates[0], error: 'not_found' };
+    return null;
+  }
 
-    for (const slug of slugCandidates) {
-      organization = await Organization.findOne({ slug }).lean();
+  if (!organization) {
+    const hostCandidates = getHostCandidates(req);
+    for (const host of hostCandidates) {
+      organization = await Organization.findOne({ allowedDomains: host }).lean();
       if (organization) {
-        resolution = { source: 'slug', value: slug };
+        resolution = { source: 'domain', value: host };
         break;
       }
-    }
-
-    if (!organization && slugCandidates.length > 0) {
-      resolution = { source: 'slug', value: slugCandidates[0], error: 'not_found' };
     }
   }
 

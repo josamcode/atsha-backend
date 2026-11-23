@@ -42,6 +42,14 @@ exports.verifyRefreshToken = (token) => {
   }
 };
 
+exports.verifyAccessToken = (token) => {
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET, { ignoreExpiration: true });
+  } catch (error) {
+    return null;
+  }
+};
+
 // Generate QR attendance token
 exports.generateQRToken = () => {
   const now = new Date();

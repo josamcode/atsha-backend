@@ -6,7 +6,8 @@ const {
   ensureOrganizationAccess,
   resolveManagedOrganization
 } = require('../utils/organizationAccess');
-const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
+const { resolveOrganizationId } = require('../utils/organizationId');
+const { getOrganizationStatusErrorCode, sendAuthError } = require('../utils/authErrors');
 const { sendEmailToUser, getInvitationEmail } = require('../utils/emailService');
 const {
   normalizeDepartmentCode,
@@ -222,6 +223,14 @@ exports.createInvitation = async (req, res) => {
 
     const normalizedEmail = String(email).trim().toLowerCase();
     const canonicalRole = normalizeRole(role);
+
+    if (canonicalRole === 'platform_admin' && normalizeRole(req.user.role) !== 'platform_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only platform admins can assign the platform admin role'
+      });
+    }
+
     const departmentInfo = parseDepartments(organization, req.body);
 
     await assertUserSeatAvailable(organization);
@@ -338,18 +347,9 @@ exports.getInvitationPreview = async (req, res) => {
       });
     }
 
-    if (req.organization && !organizationIdsMatch(req.organization, organization)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invitation does not belong to the active organization'
-      });
-    }
-
-    if (organization.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
-      });
+    const organizationErrorCode = getOrganizationStatusErrorCode(organization);
+    if (organizationErrorCode) {
+      return sendAuthError(res, organizationErrorCode);
     }
 
     res.json({
@@ -395,18 +395,9 @@ exports.acceptInvitation = async (req, res) => {
       });
     }
 
-    if (req.organization && !organizationIdsMatch(req.organization, organization)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invitation does not belong to the active organization'
-      });
-    }
-
-    if (organization.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
-      });
+    const organizationErrorCode = getOrganizationStatusErrorCode(organization);
+    if (organizationErrorCode) {
+      return sendAuthError(res, organizationErrorCode);
     }
 
     const existingUser = await User.findOne({

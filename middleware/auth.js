@@ -1,15 +1,13 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
-const resolveOrganization = require('./resolveOrganization');
 const {
   normalizeRole,
   roleMatches,
   toLegacyRole
 } = require('../utils/tenantConstants');
-const { organizationIdsMatch, resolveOrganizationId } = require('../utils/organizationId');
-
-const { resolveOrganizationContext } = resolveOrganization;
+const { resolveOrganizationId } = require('../utils/organizationId');
+const { getSessionBlockCode, sendAuthError } = require('../utils/authErrors');
 
 const getBearerToken = (req) => {
   if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
@@ -19,145 +17,64 @@ const getBearerToken = (req) => {
   return null;
 };
 
-const findOrganizationById = async (organizationId) => {
-  if (!organizationId) {
-    return null;
-  }
+const buildProtectedUserQuery = (decoded) => ({
+  _id: decoded.id,
+  $or: [
+    { organizationId: decoded.organizationId },
+    { organizationId: { $exists: false } },
+    { organizationId: null }
+  ]
+});
 
-  return Organization.findById(organizationId).lean();
-};
-
-const buildProtectedUserQuery = (decoded, req) => {
-  const query = { _id: decoded.id };
-
-  if (decoded.organizationId) {
-    query.$or = [
-      { organizationId: decoded.organizationId },
-      { organizationId: { $exists: false } },
-      { organizationId: null }
-    ];
-    return query;
-  }
-
-  if (req.organization?._id) {
-    query.$or = [
-      { organizationId: req.organization._id },
-      { organizationId: { $exists: false } },
-      { organizationId: null }
-    ];
-  }
-
-  return query;
-};
-
-// Verify JWT token
+// The token's organization is authoritative; a stale slug header must not end a valid session.
 exports.protect = async (req, res, next) => {
   const token = getBearerToken(req);
 
   if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: 'Not authorized to access this route'
-    });
+    return sendAuthError(res, 'NOT_AUTHENTICATED');
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (error) {
+    return sendAuthError(res, error.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID');
+  }
+
+  if (!decoded.organizationId) {
+    return sendAuthError(res, 'TOKEN_INVALID');
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (!req.organization) {
-      await resolveOrganizationContext(req);
+    const organization = await Organization.findById(resolveOrganizationId(decoded.organizationId)).lean();
+    if (!organization) {
+      return sendAuthError(res, 'SESSION_ORGANIZATION_NOT_FOUND');
     }
 
-    const tokenOrganization = await findOrganizationById(resolveOrganizationId(decoded.organizationId));
-    if (decoded.organizationId && !tokenOrganization) {
-      return res.status(401).json({
-        success: false,
-        message: 'Organization not found for this session'
-      });
-    }
-
-    if (req.organization && tokenOrganization && !organizationIdsMatch(req.organization, tokenOrganization)) {
-      return res.status(401).json({
-        success: false,
-        message: 'Token organization does not match the active organization'
-      });
-    }
-
-    const user = await User.findOne(buildProtectedUserQuery(decoded, req)).select('-password');
+    const user = await User.findOne(buildProtectedUserQuery(decoded)).select('-password +passwordChangedAt');
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'User not found'
-      });
+      return sendAuthError(res, 'SESSION_USER_NOT_FOUND');
     }
 
-    if (!req.organization && user.organizationId) {
-      req.organization = await findOrganizationById(resolveOrganizationId(user.organizationId));
+    const blockCode = getSessionBlockCode({ decoded, user, organization });
+    if (blockCode) {
+      return sendAuthError(res, blockCode);
     }
 
-    if (!req.organization && tokenOrganization) {
-      req.organization = tokenOrganization;
-    }
-
-    if (!req.organization) {
-      return res.status(400).json({
-        success: false,
-        message: 'Organization context is required'
-      });
-    }
-
-    if (user.organizationId && !organizationIdsMatch(user.organizationId, req.organization)) {
-      return res.status(401).json({
-        success: false,
-        message: 'User does not belong to the active organization'
-      });
-    }
-
-    if (req.organization.status !== 'active') {
-      return res.status(403).json({
-        success: false,
-        message: 'Organization is not active'
-      });
-    }
-
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'User account is deactivated'
-      });
-    }
-
-    if (decoded.role && normalizeRole(decoded.role) !== normalizeRole(user.role)) {
-      return res.status(401).json({
-        success: false,
-        message: 'User role changed. Please sign in again.'
-      });
-    }
-
-    const currentSessionVersion = req.organization.securitySettings?.sessionVersion || 1;
-    if (decoded.sessionVersion && decoded.sessionVersion !== currentSessionVersion) {
-      return res.status(401).json({
-        success: false,
-        message: 'Session is no longer valid. Please sign in again.'
-      });
-    }
-
+    req.organization = organization;
     user.organizationRole = normalizeRole(user.role);
     user.legacyRole = toLegacyRole(user.role);
     req.user = user;
     req.auth = {
-      organizationId: resolveOrganizationId(req.organization),
+      organizationId: resolveOrganizationId(organization),
       role: user.organizationRole,
       legacyRole: user.legacyRole,
       tokenRole: decoded.role || null
     };
 
-    next();
+    return next();
   } catch (error) {
-    return res.status(401).json({
-      success: false,
-      message: 'Token is not valid'
-    });
+    return next(error);
   }
 };
 
@@ -165,17 +82,11 @@ exports.protect = async (req, res, next) => {
 exports.authorize = (...roles) => {
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Not authorized to access this route'
-      });
+      return sendAuthError(res, 'NOT_AUTHENTICATED');
     }
 
     if (!roleMatches(req.user.role, roles)) {
-      return res.status(403).json({
-        success: false,
-        message: `User role ${req.user.role} is not authorized to access this route`
-      });
+      return sendAuthError(res, 'FORBIDDEN');
     }
 
     next();

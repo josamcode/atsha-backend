@@ -22,7 +22,7 @@ const userSchema = new mongoose.Schema({
     required: [true, 'Email is required'],
     lowercase: true,
     trim: true,
-    match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, 'Please provide a valid email']
+    match: [/^[^\s@]+@[^\s@.]+(\.[^\s@.]+)*\.[^\s@.]{2,}$/, 'Please provide a valid email']
   },
   phone: {
     type: String,
@@ -156,6 +156,10 @@ const userSchema = new mongoose.Schema({
     type: Date,
     select: false
   },
+  passwordChangedAt: {
+    type: Date,
+    select: false
+  },
   passwordResetRequested: {
     type: Boolean,
     default: false
@@ -198,6 +202,12 @@ userSchema.pre('save', async function (next) {
 
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
+
+  if (!this.isNew) {
+    // JWT iat has one-second precision, so tokens issued right after the change stay valid.
+    this.passwordChangedAt = new Date(Date.now() - 1000);
+  }
+
   next();
 });
 
