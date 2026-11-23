@@ -191,7 +191,9 @@ router.get('/summary', protect, async (req, res) => {
           today: todayCheckin ? 1 : 0,
           checkedIn: Boolean(todayCheckin),
           checkedOut: Boolean(todayCheckout),
-          thisMonth: thisMonthAttendance.length
+          thisMonth: new Set(
+            thisMonthAttendance.map((timestamp) => dateUtils.getDateString(timestamp))
+          ).size
         },
         leaves: {
           balance: user?.leaveBalance || 0,
@@ -270,7 +272,7 @@ router.get('/summary', protect, async (req, res) => {
         ...formQuery,
         status: 'submitted'
       }),
-      AttendanceLog.countDocuments(attendanceQuery),
+      AttendanceLog.distinct('userId', attendanceQuery),
       LeaveRequest.countDocuments({
         ...leaveQuery,
         status: 'pending'
@@ -296,7 +298,7 @@ router.get('/summary', protect, async (req, res) => {
         pendingApprovals
       },
       attendance: {
-        today: todayAttendance
+        today: todayAttendance.length
       },
       leaves: {
         pending: pendingLeaves,

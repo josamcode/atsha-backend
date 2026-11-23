@@ -20,6 +20,7 @@ const {
 const {
   getOrganizationDepartmentUserIds
 } = require('../utils/scopedUsers');
+const { getShiftTime, pairAttendanceLogs } = require('../utils/attendanceShifts');
 
 const ATTENDANCE_POPULATE = [
   {
@@ -220,81 +221,11 @@ const applyAttendanceUserScope = (query, scope) => {
   return query;
 };
 
-const groupAttendanceByDate = (logs, limit) => {
-  const checkIns = logs
-    .filter((log) => log.type === 'checkin')
-    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-  const checkOuts = logs
-    .filter((log) => log.type === 'checkout')
-    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-  const groupedByDate = {};
-
-  checkIns.forEach((checkIn) => {
-    const date = dateUtils.getDateString(checkIn.timestamp);
-    if (!groupedByDate[date]) {
-      groupedByDate[date] = {
-        date,
-        checkin: null,
-        checkout: null
-      };
-    }
-
-    if (
-      !groupedByDate[date].checkin ||
-      new Date(checkIn.timestamp) < new Date(groupedByDate[date].checkin.timestamp)
-    ) {
-      groupedByDate[date].checkin = checkIn;
-    }
-  });
-
-  checkOuts.forEach((checkOut) => {
-    const correspondingCheckIn = checkIns
-      .filter((checkIn) => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
-      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
-
-    if (correspondingCheckIn) {
-      const checkInDate = dateUtils.getDateString(correspondingCheckIn.timestamp);
-
-      if (!groupedByDate[checkInDate]) {
-        groupedByDate[checkInDate] = {
-          date: checkInDate,
-          checkin: null,
-          checkout: null
-        };
-      }
-
-      if (
-        !groupedByDate[checkInDate].checkout ||
-        new Date(checkOut.timestamp) > new Date(groupedByDate[checkInDate].checkout.timestamp)
-      ) {
-        groupedByDate[checkInDate].checkout = checkOut;
-      }
-
-      return;
-    }
-
-    const date = dateUtils.getDateString(checkOut.timestamp);
-    if (!groupedByDate[date]) {
-      groupedByDate[date] = {
-        date,
-        checkin: null,
-        checkout: null
-      };
-    }
-
-    if (
-      !groupedByDate[date].checkout ||
-      new Date(checkOut.timestamp) > new Date(groupedByDate[date].checkout.timestamp)
-    ) {
-      groupedByDate[date].checkout = checkOut;
-    }
-  });
-
-  return Object.values(groupedByDate)
-    .sort((a, b) => new Date(b.date) - new Date(a.date))
-    .slice(0, limit);
-};
+const groupAttendanceByDate = (logs, limit) => pairAttendanceLogs(logs)
+  .sort((a, b) => (
+    new Date(b.date) - new Date(a.date) || getShiftTime(b) - getShiftTime(a)
+  ))
+  .slice(0, limit);
 
 // Auto-generate QR code (called by cron job or manually by admin)
 exports.generateQRCode = async (req, res) => {
@@ -496,69 +427,16 @@ exports.recordAttendance = async (req, res) => {
       });
     }
 
-    const todayStart = dateUtils.getStartOfToday();
-    const todayEnd = dateUtils.getEndOfToday();
-
-    const todayAttendance = await AttendanceLog.find(buildTenantQuery(organization, {
-      userId: req.user.id,
-      timestamp: {
-        $gte: todayStart,
-        $lte: todayEnd
-      }
-    })).sort({ timestamp: 1 });
-
-    const hasCheckInToday = todayAttendance.some((log) => log.type === 'checkin');
-    const hasCheckOutToday = todayAttendance.some((log) => log.type === 'checkout');
-
-    if (type === 'checkin' && hasCheckInToday) {
-      return res.status(400).json({
-        success: false,
-        message: 'You have already checked in today'
-      });
-    }
-
-    if (type === 'checkout') {
-      const recentCheckIns = await AttendanceLog.find(buildTenantQuery(organization, {
+    const isFirstCheckInToday = type === 'checkin' && !(await AttendanceLog.exists(
+      buildTenantQuery(organization, {
         userId: req.user.id,
-        type: 'checkin'
-      }))
-        .sort({ timestamp: -1 })
-        .limit(1);
-
-      if (recentCheckIns.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'You must check in before checking out'
-        });
-      }
-
-      const lastCheckIn = recentCheckIns[0];
-
-      const hasCheckOutAfterCheckIn = await AttendanceLog.findOne(buildTenantQuery(organization, {
-        userId: req.user.id,
-        type: 'checkout',
-        timestamp: { $gt: lastCheckIn.timestamp }
-      }));
-
-      if (hasCheckOutAfterCheckIn && !hasCheckInToday) {
-        return res.status(400).json({
-          success: false,
-          message: 'You must check in before checking out'
-        });
-      }
-
-      if (hasCheckOutToday) {
-        const lastCheckInDate = dateUtils.getDateString(lastCheckIn.timestamp);
-        const todayDate = dateUtils.getDateString(new Date());
-
-        if (lastCheckInDate === todayDate) {
-          return res.status(400).json({
-            success: false,
-            message: 'You have already checked out today'
-          });
+        type: 'checkin',
+        timestamp: {
+          $gte: dateUtils.getStartOfToday(),
+          $lte: dateUtils.getEndOfToday()
         }
-      }
-    }
+      })
+    ));
 
     const ip = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
@@ -579,7 +457,7 @@ exports.recordAttendance = async (req, res) => {
     await qrToken.markAsUsed();
     await populateAttendanceLog(attendanceLog);
 
-    if (type === 'checkin') {
+    if (isFirstCheckInToday) {
       const user = await User.findOne(buildTenantQuery(organization, {
         _id: req.user.id
       })).select('workDays workSchedule');
@@ -827,116 +705,30 @@ exports.getAllAttendanceGrouped = async (req, res) => {
       .sort({ timestamp: -1 })
       .populate(ATTENDANCE_POPULATE);
 
-    const validLogs = logs.filter((log) => log.userId && log.userId._id);
-    const userLogs = {};
+    const logsByUser = new Map();
 
-    validLogs.forEach((log) => {
-      const currentUserId = String(log.userId._id || log.userId);
+    logs
+      .filter((log) => log.userId && log.userId._id)
+      .forEach((log) => {
+        const currentUserId = String(log.userId._id);
 
-      if (!userLogs[currentUserId]) {
-        userLogs[currentUserId] = {
-          userId: log.userId,
-          checkIns: [],
-          checkOuts: []
-        };
-      }
-
-      if (log.type === 'checkin') {
-        userLogs[currentUserId].checkIns.push(log);
-      } else if (log.type === 'checkout') {
-        userLogs[currentUserId].checkOuts.push(log);
-      }
-    });
-
-    Object.values(userLogs).forEach((entry) => {
-      entry.checkIns.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-      entry.checkOuts.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    });
-
-    const groupedByDateAndUser = {};
-
-    Object.values(userLogs).forEach(({ userId: groupedUser, checkIns }) => {
-      checkIns.forEach((checkIn) => {
-        const date = dateUtils.getDateString(checkIn.timestamp);
-        const key = `${date}_${groupedUser._id}`;
-
-        if (!groupedByDateAndUser[key]) {
-          groupedByDateAndUser[key] = {
-            date,
-            userId: groupedUser,
-            checkin: null,
-            checkout: null
-          };
+        if (!logsByUser.has(currentUserId)) {
+          logsByUser.set(currentUserId, []);
         }
 
-        if (
-          !groupedByDateAndUser[key].checkin ||
-          new Date(checkIn.timestamp) < new Date(groupedByDateAndUser[key].checkin.timestamp)
-        ) {
-          groupedByDateAndUser[key].checkin = checkIn;
-        }
+        logsByUser.get(currentUserId).push(log);
       });
-    });
 
-    Object.values(userLogs).forEach(({ userId: groupedUser, checkIns, checkOuts }) => {
-      checkOuts.forEach((checkOut) => {
-        const correspondingCheckIn = checkIns
-          .filter((checkIn) => new Date(checkIn.timestamp) < new Date(checkOut.timestamp))
-          .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
-
-        if (correspondingCheckIn) {
-          const checkInDate = dateUtils.getDateString(correspondingCheckIn.timestamp);
-          const key = `${checkInDate}_${groupedUser._id}`;
-
-          if (!groupedByDateAndUser[key]) {
-            groupedByDateAndUser[key] = {
-              date: checkInDate,
-              userId: groupedUser,
-              checkin: null,
-              checkout: null
-            };
-          }
-
-          if (
-            !groupedByDateAndUser[key].checkout ||
-            new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)
-          ) {
-            groupedByDateAndUser[key].checkout = checkOut;
-          }
-
-          return;
-        }
-
-        const date = dateUtils.getDateString(checkOut.timestamp);
-        const key = `${date}_${groupedUser._id}`;
-
-        if (!groupedByDateAndUser[key]) {
-          groupedByDateAndUser[key] = {
-            date,
-            userId: groupedUser,
-            checkin: null,
-            checkout: null
-          };
-        }
-
-        if (
-          !groupedByDateAndUser[key].checkout ||
-          new Date(checkOut.timestamp) > new Date(groupedByDateAndUser[key].checkout.timestamp)
-        ) {
-          groupedByDateAndUser[key].checkout = checkOut;
-        }
-      });
-    });
-
-    const formattedLogs = Object.values(groupedByDateAndUser)
-      .sort((a, b) => {
-        const dateCompare = new Date(b.date) - new Date(a.date);
-        if (dateCompare !== 0) {
-          return dateCompare;
-        }
-
-        return (a.userId?.name || '').localeCompare(b.userId?.name || '');
-      })
+    const formattedLogs = Array.from(logsByUser.values())
+      .flatMap((userLogs) => pairAttendanceLogs(userLogs).map((shift) => ({
+        ...shift,
+        userId: userLogs[0].userId
+      })))
+      .sort((a, b) => (
+        new Date(b.date) - new Date(a.date) ||
+        (a.userId?.name || '').localeCompare(b.userId?.name || '') ||
+        getShiftTime(b) - getShiftTime(a)
+      ))
       .slice(0, parseInt(limit, 10) || 30);
 
     res.json({
