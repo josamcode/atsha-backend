@@ -11,7 +11,9 @@ const {
   getAllAttendanceGrouped,
   cleanupExpiredQRs,
   checkAbsentUsers,
-  updateAttendanceLog
+  updateAttendanceLog,
+  getManualAttendanceUsers,
+  recordManualAttendance
 } = require('../controllers/attendanceController');
 const { protect, authorize } = require('../middleware/auth');
 const resolveOrganization = require('../middleware/resolveOrganization');
@@ -34,6 +36,10 @@ router.post('/check-absent', authorize('platform_admin', 'admin'), checkAbsentUs
 
 // All authenticated users - record attendance
 router.post('/record', requireSubscriptionFeature('qrCode'), recordAttendance);
+
+// Admins and users granted canRecordAttendance - access is checked in the controller
+router.get('/manual/users', getManualAttendanceUsers);
+router.post('/manual', recordManualAttendance);
 
 // Get my attendance
 router.get('/my-attendance', getMyAttendance);

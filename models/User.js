@@ -94,6 +94,10 @@ const userSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  canRecordAttendance: {
+    type: Boolean,
+    default: false
+  },
   workDays: [{
     type: String,
     enum: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']

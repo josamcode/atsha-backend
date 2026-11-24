@@ -138,6 +138,9 @@ const normalizeEmailValue = (value) => {
   return typeof normalized === 'string' ? normalized.toLowerCase() : normalized;
 };
 
+// Multipart form fields arrive as strings.
+const toBooleanField = (value) => value === true || value === 'true';
+
 const formatUser = (user) => {
   if (!user) {
     return null;
@@ -604,6 +607,7 @@ exports.createUser = async (req, res) => {
       role,
       languagePreference,
       leaveBalance,
+      canRecordAttendance,
       workDays,
       workSchedule,
       nationality,
@@ -655,6 +659,7 @@ exports.createUser = async (req, res) => {
       departments: departmentAssignment.departments,
       languagePreference: languagePreference || 'en',
       leaveBalance: leaveBalance || 0,
+      canRecordAttendance: toBooleanField(canRecordAttendance),
       workDays: Array.isArray(workDays) ? workDays : [],
       workSchedule: parseWorkSchedule(workSchedule, `user creation for ${normalizedEmail}`),
       nationality: nationality || undefined,
@@ -783,6 +788,9 @@ exports.updateUser = async (req, res) => {
     if (req.body.languagePreference !== undefined) updateFields.languagePreference = req.body.languagePreference;
     if (req.body.isActive !== undefined) updateFields.isActive = req.body.isActive;
     if (req.body.leaveBalance !== undefined) updateFields.leaveBalance = req.body.leaveBalance;
+    if (req.body.canRecordAttendance !== undefined) {
+      updateFields.canRecordAttendance = toBooleanField(req.body.canRecordAttendance);
+    }
     if (req.body.workDays !== undefined) updateFields.workDays = Array.isArray(req.body.workDays) ? req.body.workDays : [];
     if (req.body.workSchedule !== undefined) {
       updateFields.workSchedule = parseWorkSchedule(req.body.workSchedule, `user ${req.params.id}`);

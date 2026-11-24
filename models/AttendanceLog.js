@@ -36,6 +36,10 @@ const attendanceLogSchema = new mongoose.Schema({
   notes: {
     type: String
   },
+  recordedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
   metadata: {
     ip: String,
     device: String,

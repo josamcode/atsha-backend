@@ -30,8 +30,24 @@ const ATTENDANCE_POPULATE = [
   {
     path: 'tokenId',
     select: 'organizationId sequenceNumber token status validFrom validTo usageCount'
+  },
+  {
+    path: 'recordedBy',
+    select: 'name'
   }
 ];
+
+const MANUAL_ATTENDANCE_ROLES = new Set(['platform_admin', 'organization_admin']);
+
+const canRecordManualAttendance = (user) => (
+  MANUAL_ATTENDANCE_ROLES.has(normalizeRole(user?.role)) || user?.canRecordAttendance === true
+);
+
+const ensureManualAttendanceAccess = (req) => {
+  if (!canRecordManualAttendance(req.user)) {
+    throw createHttpError(403, 'You do not have permission to record attendance');
+  }
+};
 
 const PRIVILEGED_ATTENDANCE_ROLES = new Set([
   'platform_admin',
@@ -516,6 +532,82 @@ exports.recordAttendance = async (req, res) => {
       message: type === 'checkin'
         ? 'Checked in successfully'
         : 'Checked out successfully',
+      data: attendanceLog
+    });
+  } catch (error) {
+    sendControllerError(res, error);
+  }
+};
+
+// Employees the current user may record attendance for
+exports.getManualAttendanceUsers = async (req, res) => {
+  try {
+    ensureManualAttendanceAccess(req);
+    const organization = await resolveAttendanceOrganization(req);
+
+    const users = await User.find(buildTenantQuery(organization, { isActive: true }))
+      .select('name department')
+      .sort({ name: 1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: users
+    });
+  } catch (error) {
+    sendControllerError(res, error);
+  }
+};
+
+// Record a check-in or check-out on behalf of any employee, at any time
+exports.recordManualAttendance = async (req, res) => {
+  try {
+    ensureManualAttendanceAccess(req);
+    const organization = await resolveAttendanceOrganization(req);
+    const { userId, type, timestamp, notes } = req.body;
+    const recordedAt = timestamp ? new Date(timestamp) : null;
+
+    if (!userId || !['checkin', 'checkout'].includes(type) || !recordedAt || Number.isNaN(recordedAt.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Employee, type and time are required'
+      });
+    }
+
+    const employee = await getOrganizationUserOrThrow(organization._id, userId);
+
+    const attendanceLog = await AttendanceLog.create(attachOrganizationId({
+      userId: employee._id,
+      type,
+      timestamp: recordedAt,
+      method: 'manual',
+      notes: typeof notes === 'string' && notes.trim() ? notes.trim() : undefined,
+      recordedBy: req.user._id,
+      metadata: {
+        ip: req.ip || req.connection.remoteAddress,
+        userAgent: req.get('user-agent')
+      }
+    }, organization));
+
+    await populateAttendanceLog(attendanceLog);
+
+    await createAuditLog({
+      req,
+      organizationId: organization._id,
+      actorUserId: req.user._id,
+      action: 'attendance_log.created_manually',
+      entityType: 'attendance_log',
+      entityId: attendanceLog._id,
+      metadata: {
+        userId: employee._id,
+        type,
+        timestamp: attendanceLog.timestamp
+      }
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Attendance recorded successfully',
       data: attendanceLog
     });
   } catch (error) {

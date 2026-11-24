@@ -478,6 +478,7 @@ const formatUser = (user) => ({
   languagePreference: user.languagePreference,
   leaveBalance: user.leaveBalance,
   isActive: user.isActive,
+  canRecordAttendance: Boolean(user.canRecordAttendance),
   workDays: user.workDays || [],
   workSchedule: user.workSchedule || {}
 });
